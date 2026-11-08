@@ -14,8 +14,8 @@ tested with version 2.4.1.
 ## Features
 
 - Click room outlines on the map, review the highlighted selection, then Start.
-- Local room vacuuming with one pass; room mopping with 1–3 requested passes
-  and Normal or Wet dampness.
+- Local room vacuuming and mopping with 1–3 requested passes;
+  Normal or Wet dampness when mopping.
 - Mop Pause/Resume and Return to dock.
 - Live reported robot position, base station position, unboxed room labels
   and darker cleaned-area shading for reported passes.
@@ -51,9 +51,7 @@ polygons, map identifiers or generated household dashboard are shipped.
 ## Controls and limits
 
 The bridge selects behavior from the robot's **reported** physical mode.
-It does not remotely change the installed vacuum/mop module. Vacuum pass
-selection is currently limited to one because repeated vacuum passes have
-not been qualified; this is not a returned robot capability limit.
+Both vacuuming and mopping offer 1–3 requested passes.
 Mop dampness offers Normal and Wet. Dry, zone cleaning, spot cleaning,
 go-to commands and a general Stop/cancel action are not exposed.
 

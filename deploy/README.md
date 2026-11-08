@@ -136,9 +136,9 @@ explicit HA entity/topic mapping. Keep that output private: it contains the
 floorplan and map identifier. No real map or pre-generated household dashboard
 is included in this repository.
 
-The card supports room-outline selection and Clear selection. Mop exposes
-1–3 passes, Normal/Wet dampness and Pause/Resume; Vacuum currently supports
-one pass. Both offer Return to dock. Job phase, mode, battery, percentage,
+The card supports room-outline selection and Clear selection. Mop and Vacuum
+expose 1–3 requested passes. Mop also provides Normal/Wet dampness and
+Pause/Resume. Both offer Return to dock. Job phase, mode, battery, percentage,
 cleaned area and readable errors remain visible alongside the map.
 
 The runtime renders fresh reported moving poses, a white base-station marker,

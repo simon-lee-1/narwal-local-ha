@@ -8,7 +8,7 @@ state are separate evidence; neither alone proves physical coverage.
 | Action | Local behavior |
 |---|---|
 | Start in idle Mop mode | Freeze selected rooms, passes and dampness; send `cmd:5` once after idle checks |
-| Start in idle Vacuum mode | Freeze selected rooms with one pass; send `cmd:5` with no mop dampness values |
+| Start in idle Vacuum mode | Freeze selected rooms and passes; send `cmd:5` with no mop dampness values |
 | New job after a retained docked task | Use the mode-specific internal `cmd:4` task clearance, then require fresh idle feedback before sending the frozen plan |
 | Pause while mopping | Bare `cmd:3`, guarded by the mopping source state |
 | Start while mop-paused | Bare `cmd:3` with reverse guards; resume the existing task |
@@ -36,9 +36,9 @@ qualify, and restarting never arranges delayed motion.
 Room plans repeat each selected protocol room ID for the requested pass
 count. Normal uses `floor_type:0`; Wet uses `2`. Vacuum uses an empty
 `floor_type` array. These are decoded requested settings, not measurements
-of physical passes or water output. Mop supports 1–3 passes and Normal/Wet.
-Vacuum currently admits one pass; repeated vacuum passes and Vacuum
-Pause/Resume are unqualified. Dry is unsupported.
+of physical passes or water output. Mop and Vacuum support 1–3 requested
+passes; Mop additionally supports Normal/Wet dampness. Vacuum Pause/Resume
+are unqualified. Dry is unsupported.
 
 The runtime retains guarded operator-recovery support, but the supplied
 profile does not enable it or contain a `vacuum_resume` command. Ordinary HA
@@ -53,7 +53,7 @@ With the configured prefix represented by `<prefix>`:
 | `<prefix>/command` | Non-retained `start`, `pause`, `return_to_base`, when supported |
 | `<prefix>/command/room_clean` | Current map ID and explicit room/pass/dampness plan |
 | `<prefix>/room/set` | Exact configured room label |
-| `<prefix>/passes/set` | 1–3 in Mop mode; one in Vacuum mode |
+| `<prefix>/passes/set` | 1–3 in Mop and Vacuum modes |
 | `<prefix>/dampness/set` | Exact `Normal` or `Wet`, applicable to Mop |
 | `<prefix>/state` | Retained observed state, job status, tracking, settings and command diagnostics |
 | `<prefix>/availability` | Retained availability and offline last will |

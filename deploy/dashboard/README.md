@@ -78,7 +78,7 @@ The card uses already-transformed display-pixel outlines and identity
 calibration. Do not apply another rotation or reflection. Change the runtime's
 `map_display.transform` if needed, then regenerate the dashboard.
 
-- **Vacuum:** one requested pass.
+- **Vacuum:** choose 1–3 requested passes.
 - **Mop:** choose 1–3 requested passes and Normal or Wet dampness.
 - **Pause/Resume:** shown for supported mop states.
 - **Return to dock:** uses the ordinary local vacuum service.

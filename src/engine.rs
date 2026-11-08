@@ -689,8 +689,8 @@ impl Engine {
             if !crate::control::eligible(&profile, "vacuum_start") {
                 return Err("vacuum_profile_unavailable".into());
             }
-            if input.mop.as_ref().is_none_or(|plan| plan.passes != 1) {
-                return Err("vacuum_passes_unqualified".into());
+            if input.mop.is_none() {
+                return Err("mop_settings_unavailable".into());
             }
             input.command = "vacuum_start".into();
         }

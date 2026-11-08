@@ -250,11 +250,7 @@ fn configured_discovery(
     room["value_template"] = json!("{{ value_json.selected_room | default(none) }}");
     let mut passes = common("Cleaning passes", "passes");
     passes["min"] = json!(1);
-    passes["max"] = json!(if snapshot["status"]["clean_mode"] == 2 {
-        1
-    } else {
-        3
-    });
+    passes["max"] = json!(3);
     passes["step"] = json!(1);
     passes["mode"] = json!("box");
     passes["command_template"] = json!("{{ value | int }}");
@@ -325,7 +321,7 @@ fn command<'a>(
     let allowed = if topic == format!("{prefix}/room/set") {
         plan.rooms.iter().any(|(_, name)| name == value)
     } else if topic == format!("{prefix}/passes/set") {
-        ["1", "2", "3"].contains(&value) && (snapshot["status"]["clean_mode"] != 2 || value == "1")
+        ["1", "2", "3"].contains(&value)
     } else if topic == format!("{prefix}/dampness/set") {
         ["Normal", "Wet"].contains(&value)
     } else {
@@ -396,9 +392,6 @@ fn room_clean_input(
         dampness: request.dampness,
     };
     plan.validate(&allowed).ok()?;
-    if mode == 2 && plan.passes != 1 {
-        return None;
-    }
     // Use the existing bounded queue and serial engine owner. It obtains
     // fresh robot feedback, validates the plan again and reports refusals.
     Some(LocalInput::Command(CommandInput {
@@ -600,7 +593,6 @@ fn receipt_fields(value: Option<&Value>) -> Option<Value> {
             "mop_pause_requires_active_task",
             "mop_settings_persistence_failed",
             "vacuum_profile_unavailable",
-            "vacuum_passes_unqualified",
         ]
         .contains(&reason)
     {
@@ -755,8 +747,7 @@ fn state_publication(
     });
     output["dampness_applicable"] = json!(native_mode == Some(3));
     output["supported_passes"] = match native_mode {
-        Some(2) => json!([1]),
-        Some(3) => json!([1, 2, 3]),
+        Some(2 | 3) => json!([1, 2, 3]),
         _ => json!([]),
     };
     if let Some(state) = state {

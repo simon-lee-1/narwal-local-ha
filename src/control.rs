@@ -237,9 +237,7 @@ pub fn decide(
         }
         let (order, floor) = plan.wire(rooms)?;
         let floor = if input.command == "vacuum_start" {
-            if plan.passes != 1 {
-                return Err("vacuum_passes_unqualified".into());
-            }
+            // Keep the required field while omitting mop dampness.
             vec![]
         } else {
             floor

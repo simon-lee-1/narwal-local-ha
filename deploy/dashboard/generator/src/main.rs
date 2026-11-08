@@ -183,7 +183,7 @@ fn map_card(
         "{{\"map_id\":{},\"rooms\":[[selection]],\"passes\":",
         serde_json::to_string(map_id).expect("string serialization")
     );
-    payload.push_str(if mop { "[[repeats]]" } else { "1" });
+    payload.push_str("[[repeats]]");
     payload.push_str(",\"dampness\":\"");
     if mop {
         payload.push_str(&format!("{{{{ states('{}') }}}}", e.dampness_entity));
@@ -231,10 +231,10 @@ fn map_card(
                 "precision":0,"translations":translations}
         ],
         "map_modes":[{
-            "name":if mop {"Mop rooms"} else {"Vacuum rooms · 1 pass"},
+            "name":if mop {"Mop rooms"} else {"Vacuum rooms"},
             "icon":"mdi:floor-plan","selection_type":"ROOM","id_type":"number",
-            "max_selections":rooms.len(),"repeats_type":if mop {"EXTERNAL"} else {"NONE"},
-            "max_repeats":if mop {3} else {1},"run_immediately":false,
+            "max_selections":rooms.len(),"repeats_type":"EXTERNAL",
+            "max_repeats":3,"run_immediately":false,
             "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":mop,
                 "service_data":{"topic":format!("{}/command/room_clean",e.topic_prefix),
                     "retain":false,"qos":0,"payload":payload}},
