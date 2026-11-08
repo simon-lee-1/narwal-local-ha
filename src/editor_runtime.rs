@@ -49,6 +49,7 @@ pub enum EditorInput {
     Save { draft_id: String },
     Cancel { draft_id: String },
     Refresh,
+    VerifyCurrentMap {},
 }
 #[derive(Clone)]
 struct Draft {
@@ -68,6 +69,10 @@ struct Pending {
     before: Value,
     candidate: Value,
     aliases: BTreeMap<u64, String>,
+    #[serde(default)]
+    require_ack: bool,
+    #[serde(default)]
+    acknowledged: bool,
 }
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -141,6 +146,7 @@ fn parsed_saved(bytes: &[u8]) -> Result<Saved, String> {
                 .all(|byte| byte.is_ascii_hexdigit())
             || map_id(&pending.candidate)? != pending.map_id
             || map_id(&pending.before)? != pending.map_id
+            || (pending.acknowledged && !pending.require_ack)
         {
             return Err("editor_store_invalid".into());
         }
@@ -378,7 +384,8 @@ impl Inner {
             "operation":draft.map(|draft|draft.operation),
             "summary":draft.map(|draft|&draft.summary),
             "message":editor.message,
-            "can_save":fresh && current && editor.writable() && editor.catalog_ready,
+            "can_save":fresh && current && editor.writable() && editor.catalog_ready
+                && draft.is_some_and(|draft| draft.operation != "verify_current_map"),
             "name":editor.name,"selected_room":selected_name,
             "capabilities":{"rename":editor.store.is_some(),"split":editor.store.is_some() && editor.geometry_ready,
                 "merge":editor.store.is_some() && editor.geometry_ready,"names_are_local":true},
@@ -390,11 +397,19 @@ impl Inner {
         raw: Value,
         fresh_reply: bool,
     ) -> Result<(), String> {
+        self.accept_editor_map_result(raw, fresh_reply, None)
+    }
+    fn accept_editor_map_result(
+        &mut self,
+        raw: Value,
+        fresh_reply: bool,
+        verification_id: Option<&str>,
+    ) -> Result<(), String> {
         self.map = Some(crate::maps::parse(&raw)?);
         self.raw_map = Some(raw.clone());
         self.editor.catalog_ready = false;
         self.editor.geometry_ready = false;
-        let result = self.refresh_editor_catalog(raw, fresh_reply);
+        let result = self.refresh_editor_catalog(raw, fresh_reply, verification_id);
         if let Err(error) = &result {
             self.editor.catalog = Value::Null;
             self.editor.message = Some(error.clone());
@@ -406,7 +421,12 @@ impl Inner {
             Ok(())
         }
     }
-    fn refresh_editor_catalog(&mut self, raw: Value, fresh_reply: bool) -> Result<(), String> {
+    fn refresh_editor_catalog(
+        &mut self,
+        raw: Value,
+        fresh_reply: bool,
+        verification_id: Option<&str>,
+    ) -> Result<(), String> {
         if serde_json::to_vec(&raw)
             .map_err(|_| "editor_map_encoding")?
             .len()
@@ -423,6 +443,8 @@ impl Inner {
             .and_then(|store| store.saved.pending.clone());
         if fresh_reply
             && let Some(pending) = pending
+            && (!pending.require_ack
+                || (pending.acknowledged && verification_id == Some(pending.draft_id.as_str())))
             && crate::room_editor::map_write_matches(&pending.candidate, &raw)?
         {
             let store = self
@@ -559,6 +581,7 @@ impl Engine {
         let _serial = self.serial.lock().await;
         let result = match input {
             EditorInput::Refresh => self.editor_refresh().await,
+            EditorInput::VerifyCurrentMap {} => self.editor_verify_current_map().await,
             EditorInput::Draft { edit } => self.editor_draft(edit).await,
             EditorInput::Save { draft_id } => self.editor_save(&draft_id).await,
             EditorInput::Cancel { draft_id } => {
@@ -587,13 +610,79 @@ impl Engine {
         self.publish().await;
         result
     }
+    /// Send only the bridge's current map as a diagnostic write. The map is
+    /// frozen internally; callers cannot supply geometry or native attributes.
+    async fn editor_verify_current_map(&self) -> Result<Value, String> {
+        let id = {
+            let mut inner = self.inner.lock().await;
+            if !inner.editor.writable()
+                || !inner.state.fresh(Instant::now())
+                || inner.map_generation != Some(inner.state.generation)
+                || inner.pending_intent.is_some()
+            {
+                return Err("editor_fresh_local_map_required".into());
+            }
+            if inner.editor.draft.is_some() {
+                return Err("editor_save_or_cancel_first".into());
+            }
+            if !inner.editor.geometry_ready {
+                return Err("editor_geometry_unavailable".into());
+            }
+            let raw = inner.raw_map.clone().ok_or("editor_map_unavailable")?;
+            crate::room_editor::validated_set_params(&raw)?;
+            let map = RoomDraft::new(raw.clone(), inner.editor.aliases(&raw))?;
+            let id = random_id()?;
+            inner.editor.draft = Some(Draft {
+                id: id.clone(),
+                operation: "verify_current_map",
+                summary: "Verify the current map without editing its layout".into(),
+                catalog_revision: inner.editor.catalog["revision"]
+                    .as_str()
+                    .ok_or("editor_catalog_changed")?
+                    .into(),
+                generation: inner.state.generation,
+                transform: inner.map_display.transform,
+                map,
+            });
+            inner.editor.message = None;
+            inner.editor.confirmed = false;
+            id
+        };
+        let result = self.editor_save(&id).await;
+        if result.is_err() {
+            let mut inner = self.inner.lock().await;
+            // A definite pre-write refusal does not leave a diagnostic draft
+            // for a dashboard Save button. Uncertain writes retain their intent.
+            if inner
+                .editor
+                .store
+                .as_ref()
+                .is_some_and(|store| store.saved.pending.is_none())
+                && inner
+                    .editor
+                    .draft
+                    .as_ref()
+                    .is_some_and(|draft| draft.id == id)
+            {
+                inner.editor.draft = None;
+            }
+        }
+        result
+    }
     async fn editor_refresh(&self) -> Result<Value, String> {
-        let generation = {
+        let (generation, verification_id) = {
             let inner = self.inner.lock().await;
             if !inner.state.connected {
                 return Err("robot_disconnected".into());
             }
-            inner.state.generation
+            let verification_id = inner
+                .editor
+                .store
+                .as_ref()
+                .and_then(|store| store.saved.pending.as_ref())
+                .filter(|pending| pending.require_ack && pending.acknowledged)
+                .map(|pending| pending.draft_id.clone());
+            (inner.state.generation, verification_id)
         };
         let raw = self.request_for(Some(generation), Operation::Map).await?;
         let mut inner = self.inner.lock().await;
@@ -605,7 +694,7 @@ impl Engine {
             .store
             .as_ref()
             .is_some_and(|store| store.saved.pending.is_some());
-        inner.accept_editor_map(raw, true)?;
+        inner.accept_editor_map_result(raw, true, verification_id.as_deref())?;
         inner.map_generation = Some(generation);
         self.images.send_replace(inner.map_png(Instant::now()).ok());
         if inner.editor.draft.is_none() {
@@ -732,9 +821,9 @@ impl Engine {
             .request_for(Some(draft.generation), Operation::Map)
             .await?;
         draft.map.validate_base(&fresh_map)?;
-        let params = draft
-            .map
-            .geometry_changed()
+        let verification = draft.operation == "verify_current_map";
+        let writes_map = verification || draft.map.geometry_changed();
+        let params = writes_map
             .then(|| crate::room_editor::validated_set_params(draft.map.raw_candidate()))
             .transpose()?;
         let observation = self.command_observation(Some(draft.generation)).await?;
@@ -759,7 +848,7 @@ impl Engine {
                 .store
                 .as_mut()
                 .ok_or("editor_store_unavailable")?;
-            if !draft.map.geometry_changed() {
+            if !writes_map {
                 store.replace(Saved {
                     version: 1,
                     map_id: Some(map_id(&fresh_map)?),
@@ -782,6 +871,8 @@ impl Engine {
                 before: fresh_map.clone(),
                 candidate: draft.map.raw_candidate().clone(),
                 aliases: draft.map.aliases().clone(),
+                require_ack: verification,
+                acknowledged: false,
             };
             let mut next = store.saved.clone();
             next.pending = Some(pending);
@@ -813,6 +904,31 @@ impl Engine {
             store.replace(next)?;
             return Err("editor_write_refused_before_send".into());
         }
+        if verification {
+            // This candidate already matched before sending. Observation alone
+            // cannot prove that the setter was accepted. Keep the ACK requirement
+            // durable so a concurrent map event or restart cannot qualify it.
+            let acknowledged = sent.as_ref().is_ok_and(|receipt| {
+                receipt["transport_written"] == true && receipt["acknowledged"] == true
+            });
+            if !acknowledged {
+                return Err("editor_verification_unresolved_without_ack".into());
+            }
+            let mut inner = self.inner.lock().await;
+            let store = inner
+                .editor
+                .store
+                .as_mut()
+                .ok_or("editor_store_unavailable")?;
+            let mut next = store.saved.clone();
+            let pending = next
+                .pending
+                .as_mut()
+                .filter(|pending| pending.draft_id == id && pending.require_ack)
+                .ok_or("editor_verification_pending_changed")?;
+            pending.acknowledged = true;
+            store.replace(next)?;
+        }
         // ACK is not persistence proof. A matching fresh getter is required.
         let actual = self
             .request_for(Some(draft.generation), Operation::Map)
@@ -825,13 +941,30 @@ impl Engine {
         if inner.state.generation != draft.generation {
             return Err("connection_changed".into());
         }
-        inner.accept_editor_map(actual, true)?;
+        if verification
+            && !inner
+                .editor
+                .store
+                .as_ref()
+                .and_then(|store| store.saved.pending.as_ref())
+                .is_some_and(|pending| {
+                    pending.draft_id == id && pending.require_ack && pending.acknowledged
+                })
+        {
+            return Err("editor_verification_pending_changed".into());
+        }
+        inner.accept_editor_map_result(actual, true, verification.then_some(id))?;
         inner.editor.draft = None;
         inner.editor.confirmed = true;
         inner.editor.message = None;
         self.images.send_replace(inner.map_png(Instant::now()).ok());
         self.edit_images.send_replace(None);
-        Ok(json!({"saved":true,"robot_map_write":true,"readback_verified":true}))
+        let mut result = json!({"saved":true,"robot_map_write":true,"readback_verified":true});
+        if verification {
+            result["verified_current_map"] = json!(true);
+            result["acknowledged"] = json!(true);
+        }
+        Ok(result)
     }
 }
 fn selectable_rooms(preview: &crate::room_editor::DraftPreview) -> bool {

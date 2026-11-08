@@ -15,33 +15,161 @@ const MAX_HISTORY: usize = 16;
 const MAX_HISTORY_BYTES: usize = 32 * 1024 * 1024;
 const MAX_SET_BYTES: usize = 2 * 1024 * 1024;
 
-/// Project a validated map into the captured J1 setter contract. Getter-only
-/// fields are not sent. Native names remain untouched and must be qualified.
+/// Project a qualified getter candidate or captured wire body into the J1
+/// setter contract. The original candidate and its stored angle stay intact.
 pub fn validated_set_params(raw: &Value) -> Result<Value, String> {
     validated_set(raw).map(|(params, _, _)| params)
 }
 
-/// Confirm the fields actually written, independently of compression,
-/// attribute ordering and unrelated getter metadata. An ACK is not readback.
+/// Confirm the candidate's geometry and native attributes, independently of
+/// compression and attribute ordering. Preserve its original angle and dock
+/// pose: projecting both sides to the null wire angle would hide changes.
 pub fn map_write_matches(candidate: &Value, observed: &Value) -> Result<bool, String> {
-    let (candidate, expected_map, expected_attrs) = validated_set(candidate)?;
-    let (observed, actual_map, actual_attrs) = validated_set(observed)?;
+    let expected_profile = native_profile(candidate)?;
+    let actual_profile = native_profile(observed)?;
+    let (_, expected_map, expected_attrs) = validated_set(candidate)?;
+    let (_, actual_map, actual_attrs) = validated_set(observed)?;
+    if expected_profile != actual_profile {
+        return Ok(false);
+    }
     let geometry_equal = ["origin_x", "origin_y", "resolution"]
         .iter()
         .all(|key| candidate["map_data"][key].as_f64() == observed["map_data"][key].as_f64());
+    let pose_equal = match expected_profile {
+        NativeProfile::Getter => {
+            candidate["map_data"]["origin_angle"].as_f64()
+                == observed["map_data"]["origin_angle"].as_f64()
+                && getter_dock_pose(candidate)? == getter_dock_pose(observed)?
+        }
+        NativeProfile::CapturedWire => {
+            candidate["map_data"]["origin_angle"] == observed["map_data"]["origin_angle"]
+        }
+    };
     Ok(candidate["map_id"] == observed["map_id"]
         && expected_map.width == actual_map.width
         && expected_map.height == actual_map.height
         && geometry_equal
-        && candidate["map_data"]["origin_angle"] == observed["map_data"]["origin_angle"]
+        && pose_equal
         && expected_map.room_layer() == actual_map.room_layer()
         && expected_attrs == actual_attrs)
 }
 
 type ValidatedSet = (Value, RoomMap, BTreeMap<u64, Value>);
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeProfile {
+    Getter,
+    CapturedWire,
+}
+
+fn native_profile(raw: &Value) -> Result<NativeProfile, String> {
+    let wrapper = raw
+        .get("room_attr")
+        .and_then(Value::as_object)
+        .filter(|wrapper| wrapper.len() == 1)
+        .ok_or("editor_native_attributes_unqualified")?;
+    let attrs = wrapper
+        .get("attr")
+        .and_then(Value::as_array)
+        .filter(|attrs| !attrs.is_empty() && attrs.len() <= MAX_ROOMS)
+        .ok_or("editor_native_attributes_unqualified")?;
+    let mut profile = None;
+    for attr in attrs {
+        let count = attr
+            .as_object()
+            .ok_or("editor_native_attributes_unqualified")?
+            .len();
+        let current = match count {
+            3 => NativeProfile::Getter,
+            6 => NativeProfile::CapturedWire,
+            _ => return Err("editor_native_attributes_unqualified".into()),
+        };
+        if profile.is_some_and(|previous| previous != current) {
+            return Err("editor_native_attributes_unqualified".into());
+        }
+        profile = Some(current);
+    }
+    profile.ok_or("editor_native_attributes_unqualified".into())
+}
+
+fn getter_dock_pose(raw: &Value) -> Result<Option<[f64; 3]>, String> {
+    let fields = ["base_station_x", "base_station_y", "base_station_angle"];
+    let data = raw
+        .get("map_data")
+        .and_then(Value::as_object)
+        .ok_or("editor_map_data_required")?;
+    if fields.iter().all(|key| !data.contains_key(*key)) {
+        return Ok(None);
+    }
+    let mut pose = [0.0; 3];
+    for (index, key) in fields.iter().enumerate() {
+        pose[index] = data
+            .get(*key)
+            .and_then(Value::as_f64)
+            .filter(|value| value.is_finite())
+            .ok_or("editor_map_geometry_unqualified")?;
+    }
+    Ok(Some(pose))
+}
+
+fn validate_getter_fields(raw: &Value) -> Result<(), String> {
+    let root = raw.as_object().ok_or("editor_map_data_required")?;
+    if root.keys().any(|key| {
+        ![
+            "map_id",
+            "map_data",
+            "room_attr",
+            "clean_order",
+            "humidity",
+            "user_forbidden",
+        ]
+        .contains(&key.as_str())
+    }) {
+        return Err("editor_getter_metadata_unqualified".into());
+    }
+    let data = raw
+        .get("map_data")
+        .and_then(Value::as_object)
+        .ok_or("editor_map_data_required")?;
+    if data.keys().any(|key| {
+        ![
+            "width",
+            "height",
+            "origin_x",
+            "origin_y",
+            "origin_angle",
+            "resolution",
+            "room_layer",
+            "base_station_x",
+            "base_station_y",
+            "base_station_angle",
+        ]
+        .contains(&key.as_str())
+    }) {
+        return Err("editor_getter_metadata_unqualified".into());
+    }
+    getter_dock_pose(raw)?;
+    Ok(())
+}
+
+fn getter_wire_type(value: &Value) -> Result<i64, String> {
+    // These four pairs were observed for matching room/map identities in an
+    // acknowledged setter and a later getter. No general byte cast is assumed.
+    match value.as_i64() {
+        Some(254) => Ok(-2),
+        Some(253) => Ok(-3),
+        Some(252) => Ok(-4),
+        Some(251) => Ok(-5),
+        _ => Err("editor_native_attributes_unqualified".into()),
+    }
+}
+
 fn validated_set(raw: &Value) -> Result<ValidatedSet, String> {
     check_json(raw)?;
+    let profile = native_profile(raw)?;
+    if profile == NativeProfile::Getter {
+        validate_getter_fields(raw)?;
+    }
     let map_id = raw.get("map_id").ok_or("editor_map_id_required")?;
     if !map_id.as_u64().is_some()
         && !map_id.as_str().is_some_and(|value| {
@@ -77,11 +205,19 @@ fn validated_set(raw: &Value) -> Result<ValidatedSet, String> {
         .get("resolution")
         .and_then(Value::as_f64)
         .is_some_and(|value| value.is_finite() && value > 0.0)
-        // The acknowledged setter used null, not an invented numeric angle.
-        || data.get("origin_angle") != Some(&Value::Null)
+        || match profile {
+            NativeProfile::Getter => !data
+                .get("origin_angle")
+                .and_then(Value::as_f64)
+                .is_some_and(f64::is_finite),
+            NativeProfile::CapturedWire => data.get("origin_angle") != Some(&Value::Null),
+        }
     {
         return Err("editor_map_geometry_unqualified".into());
     }
+    // The acknowledged setter used null. This does not establish angle
+    // persistence; readback above compares the original getter's finite angle.
+    projected.insert("origin_angle".into(), Value::Null);
     let wrapper = raw
         .get("room_attr")
         .and_then(Value::as_object)
@@ -92,22 +228,40 @@ fn validated_set(raw: &Value) -> Result<ValidatedSet, String> {
         .and_then(Value::as_array)
         .filter(|attrs| !attrs.is_empty() && attrs.len() <= MAX_ROOMS)
         .ok_or("editor_native_attributes_unqualified")?;
+    let mut wire_attrs = Vec::with_capacity(attrs.len());
     for attr in attrs {
         let attr = attr
             .as_object()
-            .filter(|attr| attr.len() == 6)
             .ok_or("editor_native_attributes_unqualified")?;
         if !attr
             .get("room_id")
             .and_then(Value::as_u64)
             .is_some_and(|id| id <= 62)
-            || !matches!(attr.get("type").and_then(Value::as_i64), Some(-5..=-2))
-            || attr.get("cType").and_then(Value::as_i64) != Some(-2)
-            || attr.get("keepName").and_then(Value::as_bool) != Some(false)
             || attr.get("name").and_then(Value::as_str) != Some("")
-            || attr.get("cName").and_then(Value::as_str) != Some("")
         {
             return Err("editor_native_attributes_unqualified".into());
+        }
+        match profile {
+            NativeProfile::Getter => {
+                let room_type = getter_wire_type(
+                    attr.get("type")
+                        .ok_or("editor_native_attributes_unqualified")?,
+                )?;
+                wire_attrs.push(json!({
+                    "room_id":attr["room_id"], "type":room_type, "name":"",
+                    "cType":-2, "cName":"", "keepName":false
+                }));
+            }
+            NativeProfile::CapturedWire => {
+                if !matches!(attr.get("type").and_then(Value::as_i64), Some(-5..=-2))
+                    || attr.get("cType").and_then(Value::as_i64) != Some(-2)
+                    || attr.get("keepName").and_then(Value::as_bool) != Some(false)
+                    || attr.get("cName").and_then(Value::as_str) != Some("")
+                {
+                    return Err("editor_native_attributes_unqualified".into());
+                }
+                wire_attrs.push(Value::Object(attr.clone()));
+            }
         }
     }
     // This exact order and four-field body were captured with a correlated
@@ -116,7 +270,7 @@ fn validated_set(raw: &Value) -> Result<ValidatedSet, String> {
         "map_id":map_id,
         "operations":["map_data","room_attr"],
         "map_data":projected,
-        "room_attr":{"attr":attrs}
+        "room_attr":{"attr":wire_attrs}
     });
     if serde_json::to_vec(&params)
         .map_err(|_| "editor_map_set_encoding")?

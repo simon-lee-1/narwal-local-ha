@@ -57,7 +57,8 @@ frontend's offline checks.
 Before a boundary write, the private store records the original map, exact
 candidate and pending operation. The bridge then sends the guarded local
 setter and requests the map again. A matching fresh readback confirms the
-written geometry and native attributes; an acknowledgment alone does not.
+written geometry and native attributes, including the original map angle and
+dock pose; an acknowledgment alone does not.
 The previous map remains in the private backup state after confirmation.
 
 If delivery or readback is uncertain, the pending operation remains recorded.
@@ -77,14 +78,55 @@ An earlier vendor-app split supplied a uniquely matched, successful
 merge operation. No new split or merge through this editor has yet been
 tested on the physical robot.
 
-The current writer accepts the observed native metadata profile:
-`origin_angle: null`, room `type` values from -5 through -2, `cType: -2`,
-`keepName: false`, and empty native `name` and `cName`. Other profiles are
-refused. Existing native attributes are preserved; splitting copies the
-selected room's native attributes to the new room ID. Their full semantics,
-including whether a new room needs different native metadata, remain
-unverified. Matching map readback therefore does not establish subsequent
-split/merge cleaning behavior on the device.
+The robot's getter and the app's setter use different metadata shapes.
+A later local getter matched the captured map and room identifiers and
+established these four observed type pairs:
+
+| Getter type | Setter type |
+|---|---|
+| 254 | -2 |
+| 253 | -3 |
+| 252 | -4 |
+| 251 | -5 |
+
+Getter room records contain `room_id`, `type` and an empty `name`. The writer
+accepts this profile with a finite `origin_angle`, and either all three finite
+`base_station_x`, `base_station_y`, `base_station_angle` fields or none.
+It projects the four explicit type pairs into the captured setter shape:
+`origin_angle: null`, `cType: -2`, `keepName: false`, and empty native `name`
+and `cName`. Other type values, partial or mixed attribute profiles, native
+custom names and unknown getter metadata are refused. The exact outgoing
+wire body is validated again by the session before sending.
+
+The original getter-shaped candidate retains its finite map angle and dock
+pose. Fresh readback must match those original values and their presence;
+the null wire angle is never a wildcard. The historical setter and later
+getter differed in grid dimensions, origin and cells, and there was no saved
+post-set getter. Their attribute correspondence therefore does not establish
+geometry or angle persistence for a future write.
+
+Splitting copies the selected room's native attributes to the new room ID.
+Their full semantics, including whether a new room needs different native
+metadata, remain unverified. Matching map readback does not establish
+subsequent split/merge cleaning behavior on the device.
+
+For device qualification, the local HTTP API accepts
+`POST /api/room-editor` with `{"action":"verify_current_map"}`. This diagnostic
+has no dashboard button or MQTT command and accepts no caller-supplied map.
+It uses the current layout as its candidate and the same fresh idle checks,
+private original-map backup and guarded writer. It is a real write intended
+to preserve the layout, not a guaranteed no-op. Success requires confirmed
+transport writing, acknowledgment and fresh readback matching the stored
+candidate, including its angle and dock pose. An unacknowledged pending
+verification cannot be cleared by matching map data alone, and it is never
+automatically retried. Background map notifications do not confirm verification.
+An interrupted verification with a recorded acknowledgment requires an explicit
+**Refresh result** to request and compare a fresh map.
+
+The current layout was written once and acknowledged by the J1.
+Fresh readback matched the original layout, map rotation, dock position
+and cleaning settings. This verifies the local writer with the existing layout;
+new split/merge metadata and subsequent room-cleaning behavior remain untested.
 
 Room naming uses local aliases because native custom-name semantics have not
 been qualified. The distributed repository excludes the development tests,
