@@ -1,0 +1,351 @@
+use serde::Deserialize;
+use serde_json::{Value, json};
+use std::{
+    collections::BTreeSet,
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    path::Path,
+};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Entities {
+    topic_prefix: String,
+    vacuum_entity: String,
+    map_entity: String,
+    job_entity: String,
+    mode_entity: String,
+    battery_entity: String,
+    progress_entity: String,
+    area_entity: String,
+    dock_entity: String,
+    error_entity: String,
+    dampness_entity: String,
+}
+
+fn require(value: bool, message: &str) -> Result<(), String> {
+    if value { Ok(()) } else { Err(message.into()) }
+}
+
+fn valid_entity(value: &str, domain: &str) -> bool {
+    value.len() <= 255
+        && value
+            .strip_prefix(&format!("{domain}."))
+            .is_some_and(|name| {
+                !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+            })
+}
+
+fn validate_entities(e: &Entities) -> Result<(), String> {
+    require(
+        !e.topic_prefix.is_empty()
+            && e.topic_prefix.len() <= 200
+            && !e.topic_prefix.starts_with('/')
+            && !e.topic_prefix.ends_with('/')
+            && !e.topic_prefix.contains("//")
+            && e.topic_prefix
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"/_-".contains(&c)),
+        "topic_prefix must contain only ASCII letters, digits, slash, underscore or hyphen",
+    )?;
+    for (entity, domain) in [
+        (&e.vacuum_entity, "vacuum"),
+        (&e.map_entity, "image"),
+        (&e.job_entity, "sensor"),
+        (&e.mode_entity, "sensor"),
+        (&e.battery_entity, "sensor"),
+        (&e.progress_entity, "sensor"),
+        (&e.area_entity, "sensor"),
+        (&e.dock_entity, "binary_sensor"),
+        (&e.error_entity, "sensor"),
+        (&e.dampness_entity, "select"),
+    ] {
+        require(
+            valid_entity(entity, domain),
+            "invalid entity ID or domain in entity configuration",
+        )?;
+    }
+    Ok(())
+}
+
+fn current_rooms(state: &Value) -> Result<(String, Vec<Value>), String> {
+    require(
+        state["connected"] == true && state["online"] == true,
+        "robot must be locally connected",
+    )?;
+    require(
+        state["age_seconds"].as_u64().is_some_and(|age| age <= 30),
+        "robot state is not fresh",
+    )?;
+    require(
+        state["map_tracking"]["map_current"] == true,
+        "current connection has no current map",
+    )?;
+    let display = &state["map_tracking"]["display"];
+    require(
+        display["coordinate_space"] == "display_pixels",
+        "room coordinates are not display pixels",
+    )?;
+    let map_id = state["map"]["map_id"].as_str().ok_or("missing map ID")?;
+    // The map pin is inserted into a HA template in Mop mode. Constrain its
+    // representation so a map ID cannot introduce template expressions.
+    require(
+        !map_id.is_empty()
+            && map_id.len() <= 256
+            && map_id
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || b"-_.:".contains(&c)),
+        "map ID has an unsupported representation",
+    )?;
+    let width = state["map"]["width"].as_u64().ok_or("missing map width")?;
+    let height = state["map"]["height"]
+        .as_u64()
+        .ok_or("missing map height")?;
+    require(
+        width > 0 && height > 0 && width <= 4096 && height <= 4096,
+        "invalid map dimensions",
+    )?;
+    let catalog = state["mop_settings"]["rooms"]
+        .as_array()
+        .ok_or("missing configured room catalog")?;
+    require(
+        !catalog.is_empty() && catalog.len() <= 32,
+        "invalid configured room count",
+    )?;
+    let mut allowed = BTreeSet::new();
+    for room in catalog {
+        let id = room["id"].as_u64().ok_or("invalid configured room ID")?;
+        require(
+            id <= 255 && allowed.insert(id),
+            "invalid or duplicate configured room ID",
+        )?;
+    }
+    let candidates = display["rooms"]
+        .as_array()
+        .ok_or("missing display room outlines")?;
+    let mut found = BTreeSet::new();
+    let mut rooms = Vec::new();
+    for room in candidates {
+        let id = room["room_id"].as_u64().ok_or("invalid map room ID")?;
+        if !allowed.contains(&id) {
+            continue;
+        }
+        require(
+            found.insert(id),
+            "duplicate configured room in map metadata",
+        )?;
+        require(
+            room["outline_error"].is_null(),
+            "configured room has an ambiguous or unavailable outline",
+        )?;
+        let outline = room["outline"].as_array().ok_or("missing room outline")?;
+        require(
+            outline.len() >= 3 && outline.len() <= 65536,
+            "invalid room outline length",
+        )?;
+        for point in outline {
+            let point = point.as_array().ok_or("invalid outline point")?;
+            require(point.len() == 2, "invalid outline point dimensions")?;
+            require(
+                point[0].as_u64().is_some_and(|x| x <= width)
+                    && point[1].as_u64().is_some_and(|y| y <= height),
+                "outline point lies outside the displayed map",
+            )?;
+        }
+        rooms.push(json!({"id":id, "outline":outline, "default_state":"unselected"}));
+    }
+    require(found == allowed, "configured room missing from current map")?;
+    Ok((map_id.to_owned(), rooms))
+}
+
+fn action(service: &str, e: &Entities) -> Value {
+    json!({"action":"call-service","service":service,"service_data":{"entity_id":e.vacuum_entity}})
+}
+
+fn map_card(
+    mode: &str,
+    e: &Entities,
+    map_id: &str,
+    rooms: &[Value],
+    translations: &Value,
+) -> Value {
+    let mop = mode == "Mop";
+    let handler = format!(
+        "{}-{}-map",
+        e.vacuum_entity.replace('.', "-"),
+        mode.to_lowercase()
+    );
+    let mut payload = format!(
+        "{{\"map_id\":{},\"rooms\":[[selection]],\"passes\":",
+        serde_json::to_string(map_id).expect("string serialization")
+    );
+    payload.push_str(if mop { "[[repeats]]" } else { "1" });
+    payload.push_str(",\"dampness\":\"");
+    if mop {
+        payload.push_str(&format!("{{{{ states('{}') }}}}", e.dampness_entity));
+    } else {
+        payload.push_str("Normal");
+    }
+    payload.push_str("\"}");
+    let mut icons = vec![
+        json!({"icon":"mdi:selection-remove","tooltip":"Clear room selection",
+            "tap_action":{"action":"fire-dom-event","xiaomi_vacuum_map_card":{
+                "action_handler_id":handler,"action":"selection.clear"}}}),
+        json!({"icon":"mdi:home-import-outline","tooltip":"Return to dock",
+            "tap_action":action("vacuum.return_to_base", e)}),
+    ];
+    if mop {
+        icons.extend([
+            json!({"icon":"mdi:pause","tooltip":"Pause",
+                "conditions":[{"entity":e.vacuum_entity,"value":"cleaning"}],
+                "tap_action":action("vacuum.pause", e)}),
+            json!({"icon":"mdi:play-pause","tooltip":"Resume current task",
+                "conditions":[{"entity":e.vacuum_entity,"value":"paused"}],
+                "tap_action":action("vacuum.start", e)}),
+            json!({"type":"menu","menu_id":"dampness","icon_id":"dampness",
+                "entity":e.dampness_entity,"available_values_attribute":"options",
+                "icon":"mdi:water","tooltip":"Mop dampness",
+                "icon_mapping":{"Normal":"mdi:water","Wet":"mdi:water-plus"},
+                "tap_action":{"action":"call-service","service":"select.select_option",
+                    "service_data":{"entity_id":e.dampness_entity,"option":"[[value]]"}}}),
+        ]);
+    }
+    json!({
+        "type":"custom:xiaomi-vacuum-map-card","title":"Narwal J1",
+        "action_handler_id":handler,"entity":e.vacuum_entity,
+        "map_source":{"camera":e.map_entity},"calibration_source":{"identity":true},
+        "map_locked":true,"two_finger_pan":true,"clean_selection_on_start":true,"debug":false,
+        "icons":icons,
+        "tiles":[
+            {"entity":e.job_entity,"label":"Job","icon":"mdi:robot-vacuum"},
+            {"entity":e.mode_entity,"label":"Mode","icon":if mop {"mdi:spray-bottle"} else {"mdi:vacuum"}},
+            {"entity":e.battery_entity,"label":"Battery","icon":"mdi:battery","unit":"%","precision":0},
+            {"entity":e.progress_entity,"label":"Progress","icon":"mdi:progress-check","unit":"%","precision":0},
+            {"entity":e.area_entity,"label":"Cleaned area","icon":"mdi:texture-box","unit":"m²","precision":1},
+            {"entity":e.dock_entity,"label":"Dock","icon":"mdi:home","translations":{"on":"At dock","off":"Away"}},
+            {"entity":e.error_entity,"label":"Robot status","icon":"mdi:alert-circle-check-outline",
+                "precision":0,"translations":translations}
+        ],
+        "map_modes":[{
+            "name":if mop {"Mop rooms"} else {"Vacuum rooms · 1 pass"},
+            "icon":"mdi:floor-plan","selection_type":"ROOM","id_type":"number",
+            "max_selections":rooms.len(),"repeats_type":if mop {"EXTERNAL"} else {"NONE"},
+            "max_repeats":if mop {3} else {1},"run_immediately":false,
+            "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":mop,
+                "service_data":{"topic":format!("{}/command/room_clean",e.topic_prefix),
+                    "retain":false,"qos":0,"payload":payload}},
+            "predefined_selections":rooms
+        }]
+    })
+}
+
+fn generate(state: &Value, e: &Entities) -> Result<Value, String> {
+    validate_entities(e)?;
+    let (map_id, rooms) = current_rooms(state)?;
+    let mut translations: Value = serde_json::from_str(include_str!("../../error-labels.json"))
+        .map_err(|_| "invalid packaged error labels")?;
+    let labels =
+        serde_json::to_string(&translations).map_err(|_| "error label serialization failed")?;
+    translations["0"] = json!("No error");
+    let error_text = format!(
+        "{{% set code = states('{}') %}}{{% set error_labels = {} %}}**{{{{ error_labels.get(code, 'Unrecognized robot error.') }}}}**\n\n\
+         {{% if code == '3018' %}}Refill and reseat the clean-water tank.{{% elif code == '3019' %}}Empty and reseat the wastewater tank.{{% endif %}}\n\n\
+         A new cleaning command is refused until the robot reports the fault has cleared.\n\n*Error code: {{{{ code }}}}*",
+        e.error_entity, labels
+    );
+    let mut cards = vec![
+        json!({"type":"conditional","conditions":[
+            {"condition":"state","entity":e.error_entity,"state_not":"0"},
+            {"condition":"state","entity":e.error_entity,"state_not":"unknown"},
+            {"condition":"state","entity":e.error_entity,"state_not":"unavailable"}
+        ],"card":{"type":"markdown","title":"Robot needs attention","content":error_text}}),
+        json!({"type":"conditional","conditions":[{"condition":"or","conditions":[
+            {"condition":"state","entity":e.vacuum_entity,"state":"unavailable"},
+            {"condition":"state","entity":e.vacuum_entity,"state":"unknown"}
+        ]}],"card":{"type":"markdown","content":"**J1 is offline.** Waiting for the local connection. Live position and controls will return when the robot reconnects."}}),
+    ];
+    for mode in ["Vacuum", "Mop"] {
+        cards.push(json!({"type":"conditional","conditions":[
+            {"condition":"state","entity":e.mode_entity,"state":mode},
+            {"condition":"state","entity":e.vacuum_entity,"state_not":"unavailable"},
+            {"condition":"state","entity":e.vacuum_entity,"state_not":"unknown"},
+            {"condition":"state","entity":e.map_entity,"state_not":"unavailable"},
+            {"condition":"state","entity":e.map_entity,"state_not":"unknown"}
+        ],"card":map_card(mode, e, &map_id, &rooms, &translations)}));
+    }
+    cards.push(json!({"type":"markdown","content":
+        "**Tap a room area to select it; tap it again to remove it.** Check the highlighted rooms, then press ▶ to clean all selected rooms. **Clear room selection** removes every selection.\n\n\
+         **Robot:** red circle · **Dock:** white square. Darker areas show robot-reported cleaning passes. Progress and area may reset or retain the previous job after docking."}));
+    Ok(
+        json!({"title":"Narwal","views":[{"title":"Narwal","path":"overview","icon":"mdi:robot-vacuum",
+        "type":"sections","max_columns":2,"sections":[{"type":"grid","column_span":2,
+        "cards":[{"type":"vertical-stack","grid_options":{"columns":"full"},"cards":cards}]}]}]}),
+    )
+}
+
+fn read_json(path: &Path, private: bool) -> Result<Value, String> {
+    let metadata = fs::symlink_metadata(path).map_err(|_| "input file unavailable")?;
+    require(
+        metadata.is_file() && metadata.len() <= 16 * 1024 * 1024,
+        "input must be a regular file of at most 16 MiB",
+    )?;
+    if private {
+        require(
+            metadata.permissions().mode() & 0o077 == 0,
+            "state snapshot must be private (mode 0600)",
+        )?;
+    }
+    let bytes = fs::read(path).map_err(|_| "input file cannot be read")?;
+    serde_json::from_slice(&bytes).map_err(|_| "input is not valid JSON".into())
+}
+
+fn run() -> Result<(), String> {
+    let args: Vec<_> = std::env::args_os().collect();
+    require(
+        args.len() == 4,
+        "usage: narwal-dashboard-config STATE.json ENTITIES.json NEW-DASHBOARD.json",
+    )?;
+    let input = read_json(Path::new(&args[1]), true)?;
+    let state = input.get("local_status").unwrap_or(&input);
+    let config = read_json(Path::new(&args[2]), false)?;
+    let entities: Entities =
+        serde_json::from_value(config).map_err(|_| "invalid entity configuration fields")?;
+    let dashboard = generate(state, &entities)?;
+    let output = Path::new(&args[3]);
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let metadata = fs::symlink_metadata(parent).map_err(|_| "output directory unavailable")?;
+    require(
+        metadata.is_dir() && metadata.permissions().mode() & 0o077 == 0,
+        "output must be in an existing private directory (mode 0700)",
+    )?;
+    let mut bytes =
+        serde_json::to_vec_pretty(&dashboard).map_err(|_| "dashboard serialization failed")?;
+    bytes.push(b'\n');
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(output)
+        .map_err(|_| "cannot create private output; existing files are never overwritten")?;
+    file.write_all(&bytes)
+        .map_err(|_| "dashboard write failed")?;
+    file.sync_all().map_err(|_| "dashboard sync failed")?;
+    println!(
+        "Created private dashboard configuration. No network requests or robot commands were sent."
+    );
+    Ok(())
+}
+
+fn main() {
+    if let Err(message) = run() {
+        eprintln!("{message}");
+        std::process::exit(1);
+    }
+}

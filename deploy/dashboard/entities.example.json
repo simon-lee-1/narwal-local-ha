@@ -1,0 +1,13 @@
+{
+  "topic_prefix": "narwal/j1",
+  "vacuum_entity": "vacuum.narwal_j1",
+  "map_entity": "image.narwal_j1_room_map",
+  "job_entity": "sensor.narwal_j1_job_status",
+  "mode_entity": "sensor.narwal_j1_reported_mode",
+  "battery_entity": "sensor.narwal_j1_battery",
+  "progress_entity": "sensor.narwal_j1_cleaning_progress",
+  "area_entity": "sensor.narwal_j1_cleaned_area",
+  "dock_entity": "binary_sensor.narwal_j1_docked",
+  "error_entity": "sensor.narwal_j1_error_code",
+  "dampness_entity": "select.narwal_j1_mop_dampness"
+}

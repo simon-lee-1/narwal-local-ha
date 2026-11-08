@@ -1,0 +1,27 @@
+[package]
+name = "narwal-local-service"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Local Narwal J1 bridge for Home Assistant MQTT discovery"
+repository = "https://github.com/simon-lee-1/narwal-local-ha-private"
+
+[dependencies]
+axum = "0.8.9"
+base64 = "0.22.1"
+flate2 = "1.1"
+futures-util = { version = "0.3", features = ["sink"] }
+libc = "0.2"
+png = "0.18"
+ring = "0.17"
+rumqttc = "0.25"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1.54", features = ["macros", "rt-multi-thread", "net", "sync", "time", "io-util", "signal", "process", "fs"] }
+tokio-tungstenite = "0.28"
+
+
+[profile.release]
+lto = "thin"
+strip = true
+

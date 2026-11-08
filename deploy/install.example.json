@@ -1,0 +1,22 @@
+{
+  "bind_ipv4": "REPLACE_WITH_LOCAL_BRIDGE_IPV4",
+  "robot_ipv4": "REPLACE_WITH_ROBOT_IPV4",
+  "map_display": {
+    "transform": "identity",
+    "room_labels": true,
+    "show_trail": false
+  },
+  "mqtt": {
+    "host": "REPLACE_WITH_LOCAL_BROKER_IPV4",
+    "port": 1883,
+    "username": "REPLACE_WITH_MQTT_USERNAME",
+    "password": "REPLACE_WITH_MQTT_PASSWORD",
+    "topic_prefix": "narwal/j1",
+    "client_id": "narwal-j1-local"
+  },
+  "settings": {
+    "version": 1,
+    "rooms": [{"id": 0, "name": "Example room"}],
+    "selected": {"rooms": [0], "passes": 1, "dampness": "Normal"}
+  }
+}

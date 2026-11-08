@@ -1,0 +1,309 @@
+{
+  "evidence": "Legacy J1 local command contracts derived from credited upstream protocol references and device observations. Mop Start, guarded floor Pause/Resume, room settings, Return, and retained docked-task preparation were qualified through local Home Assistant runs. Generic room and floor arrays are replaced by the validated frozen settings plan. Vacuum Start has a separate mode-2 idle/floor-feedback contract, empty floor_type, and one requested pass. Internal vacuum_end_task clears a retained docked mode-2 task before a fresh selected job; Start requires newer same-connection idle feedback, no main task, empty clean_order and queue. No general Stop action is exposed. See docs/CONTROL.md for limits. Physical water delivery, completed pass count, Dry, arbitrary models and cloud-independent cold startup are not asserted.",
+  "commands": {
+    "start": {
+      "params": {
+        "cmd": 5,
+        "clean_order": [
+          0
+        ],
+        "floor_type": [
+          0
+        ]
+      },
+      "expected_robot_status": [
+        302
+      ],
+      "expected_docked": false,
+      "rooms_supported": true,
+      "source_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ]
+    },
+    "pause": {
+      "params": {
+        "cmd": 3
+      },
+      "expected_robot_status": [
+        303
+      ],
+      "expected_docked": false,
+      "rooms_supported": false,
+      "source_states": [
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ]
+    },
+    "resume": {
+      "params": {
+        "cmd": 3
+      },
+      "expected_robot_status": [
+        302
+      ],
+      "expected_docked": false,
+      "rooms_supported": false,
+      "source_states": [
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ]
+    },
+    "return_to_base": {
+      "params": {
+        "cmd": 1
+      },
+      "expected_robot_status": [
+        100,
+        303,
+        600
+      ],
+      "expected_docked": null,
+      "rooms_supported": false,
+      "source_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 302,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 300,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 600,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 600,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        },
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 600,
+          "work_status": 0,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 600,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        },
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        },
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ]
+    },
+    "end_task": {
+      "params": {
+        "cmd": 4
+      },
+      "expected_robot_status": [
+        100
+      ],
+      "expected_docked": true,
+      "rooms_supported": false,
+      "source_states": [
+        {
+          "robot_status": 303,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ]
+    },
+    "vacuum_start": {
+      "params": {
+        "cmd": 5,
+        "clean_order": [
+          0
+        ],
+        "floor_type": []
+      },
+      "expected_robot_status": [
+        300
+      ],
+      "expected_docked": false,
+      "rooms_supported": true,
+      "source_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 300,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 300,
+          "work_status": 1,
+          "station_contact": false,
+          "error_code": 0
+        }
+      ]
+    },
+    "vacuum_end_task": {
+      "params": {
+        "cmd": 4
+      },
+      "expected_robot_status": [
+        100
+      ],
+      "expected_docked": true,
+      "rooms_supported": false,
+      "source_states": [
+        {
+          "robot_status": 301,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "no_op_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ],
+      "feedback_states": [
+        {
+          "robot_status": 100,
+          "work_status": 0,
+          "station_contact": true,
+          "error_code": 0
+        }
+      ]
+    }
+  }
+}
