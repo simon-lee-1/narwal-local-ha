@@ -7,13 +7,14 @@ your local MQTT broker. The running bridge uses no Narwal account credentials
 or cloud client.
 
 This is a Linux service, not a HACS integration. Home Assistant needs its
-standard MQTT integration. The interactive frontend uses the unchanged
+standard MQTT integration. The interactive frontend builds on
 [Xiaomi Vacuum Map Card](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card),
-tested with version 2.4.1.
+with a small included patch for changing room catalogs.
 
 ## Features
 
 - Click room outlines on the map, review the highlighted selection, then Start.
+- Prepare room-name, split and merge edits, review the candidate map, then Save.
 - Local room vacuuming and mopping with 1–3 requested passes;
   Normal or Wet dampness when mopping.
 - Mop Pause/Resume and Return to dock.
@@ -29,6 +30,11 @@ decoded command settings; physical pass count and water delivery have not
 been measured. The robot's progress percentage can reset when a task ends
 without a final 100% report. Map coverage, task state and dock contact are
 separate observations.
+
+The room editor reports which operations its local backend can currently
+save. It keeps draft previews separate from the committed map and requires
+an explicit Save. See the [room editor guide](docs/ROOM_EDITOR.md) for setup,
+the editing workflow, recovery and device-verification limits.
 
 ## Install
 
@@ -82,7 +88,7 @@ map's base station. Stale off-dock markers disappear; a selected room is not
 position evidence. The optional blue pose-history trail is hidden by default;
 reported cleaning shading and robot/base markers remain visible.
 
-The map and generated dashboard contain your floorplan and room identifiers.
+The live map, room catalog and state snapshots contain your floorplan and room identifiers.
 Keep snapshots, generated dashboards, configuration, credentials and journal
 files outside the checkout in private directories. MQTT map data is also
 private household data. This distribution excludes tests, fixtures, captured
@@ -100,5 +106,6 @@ comparison with newer local-protocol devices; its documentation excludes J1/T10.
 The Rust bridge and dashboard generator are MIT licensed. Upstream revisions
 and MIT/Apache notices are retained in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). Cargo dependencies retain
-their respective licenses. The unchanged Xiaomi frontend is installed
-separately through HACS; its source and compiled bundle are not vendored here.
+their respective licenses. A pinned Xiaomi source patch and built frontend
+resource are included. Config Template Card is installed separately through
+HACS for the editor's Save and Cancel actions.

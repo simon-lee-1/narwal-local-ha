@@ -10,11 +10,12 @@ use tokio::sync::{mpsc, watch};
 
 const MAX_STATE_BYTES: usize = 65536;
 const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_OUTBOX: usize = 17;
+const MAX_OUTBOX: usize = 32;
 const MAX_AGE: u64 = 30;
 const MAX_ROOM_CLEAN_BYTES: usize = 2048;
 
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MqttConfig {
     pub host: String,
     pub port: u16,
@@ -31,7 +32,7 @@ struct Publication {
     retain: bool,
 }
 
-fn options(config: &MqttConfig) -> Result<MqttOptions, String> {
+pub(crate) fn options(config: &MqttConfig) -> Result<MqttOptions, String> {
     let valid_id = !config.client_id.is_empty()
         && config.client_id.len() <= 64
         && config
@@ -230,6 +231,7 @@ fn configured_discovery(
     snapshot: &Value,
 ) -> Vec<Publication> {
     let mut publications = discovery(config, commands);
+    publications.extend(editor_discovery(config, snapshot));
     let Some(plan) = plan_view(snapshot) else {
         return publications;
     };
@@ -333,6 +335,7 @@ fn command<'a>(
 #[serde(deny_unknown_fields)]
 struct RoomCleanRequest {
     map_id: String,
+    revision: String,
     rooms: Vec<u64>,
     passes: u8,
     dampness: Dampness,
@@ -381,6 +384,9 @@ fn room_clean_input(
     if request.map_id.is_empty()
         || request.map_id.len() > 256
         || snapshot["map"]["map_id"].as_str() != Some(request.map_id.as_str())
+        || !editor_token(&request.revision)
+        || snapshot["room_catalog"]["map_id"].as_str() != Some(request.map_id.as_str())
+        || snapshot["room_catalog"]["revision"].as_str() != Some(request.revision.as_str())
     {
         return None;
     }
@@ -394,11 +400,15 @@ fn room_clean_input(
     plan.validate(&allowed).ok()?;
     // Use the existing bounded queue and serial engine owner. It obtains
     // fresh robot feedback, validates the plan again and reports refusals.
-    Some(LocalInput::Command(CommandInput {
-        command: "start".into(),
-        rooms: Vec::new(),
-        mop: Some(plan),
-    }))
+    Some(LocalInput::RoomCommand {
+        command: CommandInput {
+            command: "start".into(),
+            rooms: Vec::new(),
+            mop: Some(plan),
+        },
+        map_id: request.map_id,
+        revision: request.revision,
+    })
 }
 fn local_input(
     config: &MqttConfig,
@@ -410,6 +420,9 @@ fn local_input(
     elapsed: Duration,
 ) -> Option<LocalInput> {
     let prefix = &config.topic_prefix;
+    if let Some(suffix) = topic.strip_prefix(&format!("{prefix}/room_editor/")) {
+        return editor_input(suffix, retain, duplicate, payload, snapshot, elapsed);
+    }
     if topic == format!("{prefix}/command/room_clean") {
         return room_clean_input(retain, duplicate, payload, snapshot, elapsed);
     }
@@ -444,10 +457,13 @@ fn checked_state(snapshot: &Value) -> Result<(), String> {
     // The HTTP map card receives this bounded geometry, but public_map_tracking
     // omits it. Do not let detailed private outlines disable MQTT telemetry.
     let private_geometry = snapshot.pointer("/map_tracking/display/rooms");
+    let private_catalog = snapshot.get("room_catalog");
     let mut pending = vec![(snapshot, 0)];
     let mut count = 0usize;
     while let Some((value, depth)) = pending.pop() {
-        if private_geometry.is_some_and(|geometry| std::ptr::eq(value, geometry)) {
+        if private_geometry.is_some_and(|geometry| std::ptr::eq(value, geometry))
+            || private_catalog.is_some_and(|catalog| std::ptr::eq(value, catalog))
+        {
             continue;
         }
         count += 1;
@@ -486,28 +502,18 @@ fn checked_state(snapshot: &Value) -> Result<(), String> {
             Ok(())
         }
     }
-    fn without_field(value: &Value, path: &[&str]) -> Value {
-        let Some(fields) = value.as_object() else {
-            return value.clone();
-        };
+    fn without_fields(value: &Value, paths: &[&[&str]]) -> Value {
+        let Some(fields) = value.as_object() else { return value.clone(); };
         Value::Object(fields.iter().filter_map(|(name, child)| {
-            if name != path[0] {
-                Some((name.clone(), child.clone()))
-            } else if path.len() == 1 {
-                None
-            } else {
-                Some((name.clone(), without_field(child, &path[1..])))
-            }
+            if paths.iter().any(|path| path.len()==1 && path[0]==name) { return None; }
+            let child_paths: Vec<_> = paths.iter().filter(|path| path.len()>1 && path[0]==name)
+                .map(|path| &path[1..]).collect();
+            Some((name.clone(), if child_paths.is_empty() {child.clone()}
+                else {without_fields(child,&child_paths)}))
         }).collect())
     }
-    if private_geometry.is_some() {
-        // Clone only the retained fields after their depth/node checks. The
-        // potentially large private geometry is never copied for this check.
-        let bounded = without_field(snapshot, &["map_tracking", "display", "rooms"]);
-        serde_json::to_writer(Limited(Vec::new()), &bounded)
-    } else {
-        serde_json::to_writer(Limited(Vec::new()), snapshot)
-    }.map_err(|_| "invalid_mqtt_state".into())
+    let bounded = without_fields(snapshot,&[&["room_catalog"],&["map_tracking","display","rooms"]]);
+    serde_json::to_writer(Limited(Vec::new()), &bounded).map_err(|_| "invalid_mqtt_state".into())
 }
 fn receipt_fields(value: Option<&Value>) -> Option<Value> {
     let source = value?.as_object()?;
@@ -853,6 +859,8 @@ fn announcement(
 ) -> Result<Vec<Publication>, String> {
     let mut publications = configured_discovery(config, &enabled_commands(snapshot), snapshot);
     publications.push(state_publication(config, snapshot, elapsed)?);
+    publications.push(catalog_publication(config, snapshot));
+    publications.push(editor_state_publication(config, snapshot, elapsed));
     publications.extend(image_publications(config, image)?);
     publications.push(availability_publication(config, online(snapshot, elapsed)));
     Ok(publications)
@@ -923,16 +931,19 @@ fn reconcile(
     elapsed: Duration,
     outbox: &mut Outbox,
     availability: &mut Availability,
-    published_features: &mut Option<(Vec<&'static str>, Option<u64>)>,
+    published_features: &mut Option<(Vec<&'static str>, Option<u64>, Option<Value>)>,
     now: Instant,
 ) -> Result<(), String> {
     outbox.push(state_publication(config, snapshot, elapsed)?)?;
     let commands = enabled_commands(snapshot);
-    let fingerprint = (commands.clone(), snapshot["status"]["clean_mode"].as_u64());
+    let fingerprint = (commands.clone(), snapshot["status"]["clean_mode"].as_u64(),catalog_value(snapshot));
+    let catalog_changed = published_features.as_ref().is_none_or(|previous| previous.2 != fingerprint.2);
     if published_features.as_ref() != Some(&fingerprint) {
         outbox.extend(configured_discovery(config, &commands, snapshot))?;
         *published_features = Some(fingerprint);
     }
+    if catalog_changed { outbox.push(catalog_publication(config,snapshot))?; }
+    outbox.push(editor_state_publication(config,snapshot,elapsed))?;
     let current = online(snapshot, elapsed);
     if availability.due(current, now) {
         outbox.push(availability_publication(config, current))?;
@@ -943,11 +954,13 @@ pub async fn run(
     config: MqttConfig,
     mut state: watch::Receiver<Value>,
     mut image: watch::Receiver<Option<Vec<u8>>>,
+    mut edit_image: watch::Receiver<Option<Vec<u8>>>,
     commands: mpsc::Sender<LocalInput>,
 ) -> Result<(), String> {
     let mqtt_options = options(&config)?;
     let (mut snapshot, mut observed) = observe(&mut state)?;
     let mut image_open = true;
+    let mut edit_image_open = true;
     loop {
         // A new client drops the previous transport's pending publications. A
         // reconnect rebuilds state from current watches instead of replaying health.
@@ -984,10 +997,17 @@ pub async fn run(
                             outbox.extend(image_publications(&config,image.borrow_and_update().as_deref())?)?;
                         }
                     },
+                    changed = edit_image.changed(), if edit_image_open => {
+                        if changed.is_err() { edit_image_open = false; }
+                        if connected {
+                            outbox.extend(preview_image_publications(&config,edit_image.borrow_and_update().as_deref())?)?;
+                        }
+                    },
                     _ = tick.tick(), if connected => {
                         let current = online(&snapshot,observed.elapsed());
                         if availability.due(current,Instant::now()) {
                             outbox.push(state_publication(&config,&snapshot,observed.elapsed())?)?;
+                            outbox.push(editor_state_publication(&config,&snapshot,observed.elapsed()))?;
                             outbox.push(availability_publication(&config,current))?;
                         }
                     },
@@ -998,7 +1018,9 @@ pub async fn run(
                             // Subscribe at QoS 0: a reconnect must not replay a motion request.
                             client.try_subscribe(format!("{}/command",config.topic_prefix),QoS::AtMostOnce)
                                 .map_err(|_|"mqtt_subscribe_failed")?;
-                            for suffix in ["room/set", "passes/set", "dampness/set", "command/room_clean"] {
+                            for suffix in ["room/set", "passes/set", "dampness/set", "command/room_clean",
+                                "room_editor/draft", "room_editor/save", "room_editor/cancel", "room_editor/refresh",
+                                "room_editor/name/set", "room_editor/room/set"] {
                                 client.try_subscribe(format!("{}/{suffix}",config.topic_prefix),QoS::AtMostOnce)
                                     .map_err(|_|"mqtt_subscribe_failed")?;
                             }
@@ -1009,9 +1031,10 @@ pub async fn run(
                             }
                             outbox.extend(announcement(&config,&snapshot,observed.elapsed(),
                                 image.borrow_and_update().as_deref())?)?;
+                            outbox.extend(preview_image_publications(&config,edit_image.borrow_and_update().as_deref())?)?;
                             availability.due(online(&snapshot,observed.elapsed()),Instant::now());
                             published_features = Some((enabled_commands(&snapshot),
-                                snapshot["status"]["clean_mode"].as_u64()));
+                                snapshot["status"]["clean_mode"].as_u64(),catalog_value(&snapshot)));
                         },
                         Ok(Event::Incoming(Incoming::Publish(message))) => {
                             if state.has_changed().map_err(|_|"mqtt_state_closed")? {
@@ -1024,6 +1047,7 @@ pub async fn run(
                             if message.topic == "homeassistant/status" && message.payload.as_ref() == b"online" {
                                 outbox.extend(announcement(&config,&snapshot,observed.elapsed(),
                                     image.borrow().as_deref())?)?;
+                                outbox.extend(preview_image_publications(&config,edit_image.borrow().as_deref())?)?;
                                 availability.due(online(&snapshot,observed.elapsed()),Instant::now());
                             } else if let Some(value) = local_input(&config,&message.topic,
                                 message.retain,message.dup,&message.payload,&snapshot,observed.elapsed())
@@ -1059,3 +1083,192 @@ pub async fn run(
 }
 
 
+
+const MAX_CATALOG_BYTES: usize = 512 * 1024;
+const MAX_EDITOR_BYTES: usize = 2048;
+
+fn editor_token(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 256
+        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+}
+fn catalog_value(snapshot: &Value) -> Option<Value> {
+    let source = snapshot.get("room_catalog")?;
+    for field in ["map_id", "revision"] {
+        if !editor_token(source[field].as_str()?) { return None; }
+    }
+    if source["coordinate_space"] != "display_pixels" { return None; }
+    let rooms = source["rooms"].as_array()?;
+    if rooms.is_empty() || rooms.len() > 32 { return None; }
+    let mut result = Vec::new();
+    let mut ids = Vec::new();
+    let mut names = Vec::new();
+    let mut total_points = 0usize;
+    for room in rooms {
+        let id = room["id"].as_u64().filter(|id| *id < 63)?;
+        let name = room["name"].as_str()?;
+        if ids.contains(&id) || names.contains(&name) || name.is_empty() || name.len() > 128
+            || name.chars().any(char::is_control) { return None; }
+        ids.push(id); names.push(name);
+        let outline = room["outline"].as_array()?;
+        total_points = total_points.checked_add(outline.len())?;
+        if outline.len() < 3 || total_points > 32768 { return None; }
+        for point in outline {
+            let point = point.as_array()?;
+            if point.len() != 2 || point.iter().any(|v|
+                !v.as_f64().is_some_and(|n| n.is_finite() && (0.0..=8192.0).contains(&n)))
+            { return None; }
+        }
+        let mut out = json!({"id":id,"name":name,"outline":outline,"default_state":"unselected"});
+        if let Some(label) = room.get("label")
+            && let (Some(x), Some(y)) = (label["x"].as_f64(), label["y"].as_f64())
+            && x.is_finite() && y.is_finite()
+        {
+            out["label"] = json!({"text":name,"x":x,"y":y,"offset_y":0});
+        }
+        result.push(out);
+    }
+    let value = json!({"map_id":source["map_id"],"revision":source["revision"],
+        "coordinate_space":"display_pixels","rooms":result});
+    (serde_json::to_vec(&value).ok()?.len() <= MAX_CATALOG_BYTES).then_some(value)
+}
+fn catalog_publication(config: &MqttConfig, snapshot: &Value) -> Publication {
+    json_publication(format!("{}/room_catalog",config.topic_prefix),
+        catalog_value(snapshot).unwrap_or(json!({"revision":null,"rooms":[]})))
+}
+fn editor_state_publication(config: &MqttConfig, snapshot: &Value, elapsed: Duration) -> Publication {
+    let source = &snapshot["room_editor"];
+    let allowed = ["idle","draft_ready","draft_blocked","saving","confirmed","refused","unavailable"];
+    let state = source["state"].as_str().filter(|s| allowed.contains(s)).unwrap_or("unavailable");
+    let fresh = online(snapshot,elapsed);
+    let mut value = json!({"state":if fresh {state}else{"unavailable"},
+        "can_save":fresh && state=="draft_ready" && source["can_save"]==true,
+        "unresolved_write":source["unresolved_write"]==true});
+    for field in ["draft_id","operation","summary","message","name","selected_room"] {
+        value[field] = source[field].as_str()
+            .filter(|text|text.len()<=512 && !text.chars().any(char::is_control))
+            .map_or(Value::Null, |text|json!(text));
+    }
+    value["capabilities"] = json!({
+        "rename":source["capabilities"]["rename"]==true,
+        "split":source["capabilities"]["split"]==true,
+        "merge":source["capabilities"]["merge"]==true,
+        "names_are_local":source["capabilities"]["names_are_local"]==true});
+    json_publication(format!("{}/room_editor/state",config.topic_prefix),value)
+}
+fn editor_discovery(config: &MqttConfig, snapshot: &Value) -> Vec<Publication> {
+    let id = &config.client_id;
+    let prefix = &config.topic_prefix;
+    let common = |name: &str, suffix: &str| {
+        json!({"name":name,"unique_id":format!("narwal_local_{id}_{suffix}"),
+            "object_id":format!("narwal_j1_{}_{suffix}",id.to_ascii_lowercase().replace('-',"_")),
+            "device":{"identifiers":[format!("narwal_local_{id}")],"name":"Narwal J1",
+                "manufacturer":"Narwal","model":"J1 local replacement"},
+            "availability_topic":format!("{prefix}/availability"),
+            "payload_available":"online","payload_not_available":"offline"})
+    };
+    let mut catalog = common("Room catalog","room_catalog");
+    catalog["state_topic"] = json!(format!("{prefix}/room_catalog"));
+    catalog["value_template"] = json!("{{ value_json.revision | default('unavailable', true) }}");
+    catalog["json_attributes_topic"] = catalog["state_topic"].clone();
+    catalog["icon"] = json!("mdi:floor-plan");
+    let mut editor = common("Room editor","room_editor");
+    editor["state_topic"] = json!(format!("{prefix}/room_editor/state"));
+    editor["value_template"] = json!("{{ value_json.state | default('unavailable') }}");
+    editor["json_attributes_topic"] = editor["state_topic"].clone();
+    let mut name = common("Room name","room_name");
+    name["state_topic"] = editor["state_topic"].clone();
+    name["value_template"] = json!("{{ value_json.name | default('', true) }}");
+    name["command_topic"] = json!(format!("{prefix}/room_editor/name/set"));
+    name["min"] = json!(0); name["max"] = json!(128); name["mode"] = json!("text");
+    name["retain"] = json!(false);name["qos"] = json!(0);name["optimistic"] = json!(false);
+    let mut room = common("Editor room","editor_room");
+    room["state_topic"] = editor["state_topic"].clone();
+    room["value_template"] = json!("{{ value_json.selected_room | default(none) }}");
+    room["command_topic"] = json!(format!("{prefix}/room_editor/room/set"));
+    room["retain"] = json!(false);room["qos"] = json!(0);room["optimistic"] = json!(false);
+    room["options"] = catalog_value(snapshot).map(|value|json!(value["rooms"].as_array().unwrap()
+        .iter().map(|room|room["name"].clone()).collect::<Vec<_>>())).unwrap_or(json!(["Unavailable"]));
+    let mut image = common("Room edit preview","room_edit_preview");
+    image.as_object_mut().unwrap().remove("availability_topic");
+    image["availability"] = json!([
+        {"topic":format!("{prefix}/availability"),"payload_available":"online","payload_not_available":"offline"},
+        {"topic":format!("{prefix}/room_editor/preview/availability"),"payload_available":"online","payload_not_available":"offline"}]);
+    image["availability_mode"] = json!("all");
+    image["image_topic"] = json!(format!("{prefix}/room_editor/preview/image"));
+    image["image_encoding"] = json!("raw");image["content_type"] = json!("image/png");
+    [("sensor","room_catalog",catalog),("sensor","room_editor",editor),("text","room_name",name),
+        ("select","editor_room",room),("image","room_edit_preview",image)]
+        .into_iter().map(|(domain,suffix,value)|
+            json_publication(format!("homeassistant/{domain}/{id}_{suffix}/config"),value)).collect()
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DraftReference { draft_id: String }
+fn editor_input(suffix: &str, retain: bool, duplicate: bool, payload: &[u8],
+    snapshot: &Value, elapsed: Duration) -> Option<LocalInput>
+{
+    use crate::engine::{DraftEdit, EditorInput};
+    if retain || duplicate || payload.len() > MAX_EDITOR_BYTES || !online(snapshot,elapsed) {
+        return None;
+    }
+    if suffix == "refresh" {
+        let body: Value = serde_json::from_slice(payload).ok()?;
+        return body.as_object().is_some_and(serde_json::Map::is_empty)
+            .then_some(LocalInput::Editor(EditorInput::Refresh));
+    }
+    let editor = &snapshot["room_editor"];
+    if editor["unresolved_write"]==true || editor["state"]=="saving" { return None; }
+    match suffix {
+        "name/set" => {
+            let name = std::str::from_utf8(payload).ok()?;
+            (name.len()<=128 && !name.chars().any(char::is_control))
+                .then(||LocalInput::EditorName(name.to_string()))
+        }
+        "room/set" => {
+            let name = std::str::from_utf8(payload).ok()?;
+            catalog_value(snapshot)?["rooms"].as_array()?.iter().any(|room|room["name"]==name)
+                .then(||LocalInput::EditorRoom(name.to_string()))
+        }
+        "draft" => {
+            if !editor["draft_id"].is_null() || snapshot["map_tracking"]["map_current"]!=true {
+                return None;
+            }
+            let edit: DraftEdit = serde_json::from_slice(payload).ok()?;
+            let catalog = catalog_value(snapshot)?;
+            let (operation,map_id,revision,rooms) = match &edit {
+                DraftEdit::Rename{map_id,revision,rooms} if rooms.len()==1 =>
+                    ("rename",map_id,revision,Some(rooms)),
+                DraftEdit::Merge{map_id,revision,rooms} if rooms.len()==2 && rooms[0]!=rooms[1] =>
+                    ("merge",map_id,revision,Some(rooms)),
+                DraftEdit::Split{map_id,revision,line} if line[0]!=line[1] && line.iter().flatten()
+                    .all(|n|n.is_finite() && (0.0..=8192.0).contains(n)) =>
+                    ("split",map_id,revision,None),
+                _ => return None,
+            };
+            if editor["capabilities"][operation]!=true || catalog["map_id"]!=map_id.as_str()
+                || catalog["revision"]!=revision.as_str()
+                || rooms.is_some_and(|rooms|rooms.iter().any(|id|
+                    !catalog["rooms"].as_array().unwrap().iter().any(|room|room["id"]==*id)))
+            { return None; }
+            Some(LocalInput::Editor(EditorInput::Draft{edit}))
+        }
+        "save" | "cancel" => {
+            let request: DraftReference = serde_json::from_slice(payload).ok()?;
+            if !editor_token(&request.draft_id) || editor["draft_id"]!=request.draft_id
+                || (suffix=="save" && (editor["state"]!="draft_ready" || editor["can_save"]!=true))
+            { return None; }
+            Some(LocalInput::Editor(if suffix=="save" {EditorInput::Save{draft_id:request.draft_id}}
+                else {EditorInput::Cancel{draft_id:request.draft_id}}))
+        }
+        _ => None,
+    }
+}
+
+fn preview_image_publications(config: &MqttConfig, image: Option<&[u8]>) -> Result<Vec<Publication>, String> {
+    let mut publications=image_publications(config,image)?;
+    for publication in &mut publications {
+        publication.topic=publication.topic.replacen(&format!("{}/map/",config.topic_prefix),
+            &format!("{}/room_editor/preview/",config.topic_prefix),1);
+    }
+    Ok(publications)
+}

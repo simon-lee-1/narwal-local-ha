@@ -8,6 +8,11 @@ use serde_json::{Value, json};
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 use tokio::sync::{Mutex, mpsc, watch};
 
+#[path = "editor_runtime.rs"]
+mod editor_runtime;
+pub(crate) use editor_runtime::validate_editor_bytes;
+pub use editor_runtime::{DraftEdit, EditorInput};
+
 // Display policy, independent of status freshness or the robot's reporting cadence.
 const POSE_DISPLAY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 // Conservative interpolation limits, not validated robot speed/brush width.
@@ -35,7 +40,8 @@ impl CleaningTrail {
     }
     fn append(&mut self, point: crate::maps::Point, now: Instant) {
         let joins = self.last_join.as_ref().is_some_and(|(last, at)| {
-            now.checked_duration_since(*at).is_some_and(|age| age < TRAIL_JOIN_TTL)
+            now.checked_duration_since(*at)
+                .is_some_and(|age| age < TRAIL_JOIN_TTL)
                 && (point.x - last.x).hypot(point.y - last.y) <= 1.0
         });
         self.points.push_back(crate::maps::TrailPoint {
@@ -62,10 +68,13 @@ pub struct Engine {
     serial: Arc<Mutex<()>>,
     pub states: watch::Sender<Value>,
     pub images: watch::Sender<Option<Vec<u8>>>,
+    pub edit_images: watch::Sender<Option<Vec<u8>>>,
 }
 struct Inner {
     state: ReportedState,
     map: Option<RoomMap>,
+    raw_map: Option<Value>,
+    editor: editor_runtime::EditorState,
     map_generation: Option<u64>,
     rendered_marker: Option<(u64, u64, &'static str)>,
     pose: Option<Value>,
@@ -114,7 +123,7 @@ fn preparation_command(
     };
     (crate::control::eligible(profile, name)
         && profile.commands[name].source_states.contains(state))
-        .then_some(name)
+    .then_some(name)
 }
 fn feedback_matches(
     command: &str,
@@ -176,7 +185,7 @@ impl Engine {
     pub fn new(profile: CommandProfile) -> Self {
         Self::build(profile, None, None)
     }
-    
+
     fn build(
         profile: CommandProfile,
         intent_store: Option<crate::intent::Store>,
@@ -185,10 +194,13 @@ impl Engine {
         let (states, _) =
             watch::channel(json!({"online":false,"connected":false,"commands_enabled":false}));
         let (images, _) = watch::channel(None);
+        let (edit_images, _) = watch::channel(None);
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 state: ReportedState::default(),
                 map: None,
+                raw_map: None,
+                editor: editor_runtime::EditorState::default(),
                 map_generation: None,
                 rendered_marker: None,
                 pose: None,
@@ -211,6 +223,7 @@ impl Engine {
             serial: Arc::new(Mutex::new(())),
             states,
             images,
+            edit_images,
         }
     }
     pub async fn snapshot(&self) -> Value {
@@ -220,12 +233,21 @@ impl Engine {
             .profile
             .commands
             .keys()
-            .filter(|name| !["end_task", "vacuum_end_task", "vacuum_start", "vacuum_resume"].contains(&name.as_str()))
+            .filter(|name| {
+                ![
+                    "end_task",
+                    "vacuum_end_task",
+                    "vacuum_start",
+                    "vacuum_resume",
+                ]
+                .contains(&name.as_str())
+            })
             .filter(|name| {
                 !(value["status"]["clean_mode"] == 2
                     && ["pause", "resume"].contains(&name.as_str()))
             })
             .filter(|_| inner.motion_ready())
+            .filter(|name| name.as_str() != "start" || inner.editor.motion_ready())
             .filter(|name| crate::control::eligible(&inner.profile, name))
             .cloned()
             .collect();
@@ -242,6 +264,8 @@ impl Engine {
         value["map_tracking"] = inner.map_tracking(Instant::now());
         value["pose_diagnostics"] = inner.pose_diagnostics(Instant::now());
         value["map_error"] = json!(inner.map_error);
+        value["room_catalog"] = inner.editor.catalog.clone();
+        value["room_editor"] = inner.editor_snapshot();
         value["last_command"] = json!(inner.last_command);
         value["last_refusal"] = json!(inner.last_refusal);
         value["mop_settings"] = json!(
@@ -259,21 +283,22 @@ impl Engine {
         );
         // This describes the currently usable internal preparation, never an
         // externally callable command or an inferred robot capability.
-        value["room_clean_preparation"] = json!(
-            if room_selection
-                && inner.pending_intent.is_none()
-                && inner.state.fresh(Instant::now())
-                && inner.mop_settings.as_ref().is_some_and(|store| store.healthy())
-            {
-                crate::control::StatePredicate::from_status(&value["status"])
-                    .zip(crate::control::MopContext::from_status(&value["status"]))
-                    .and_then(|(state, context)| {
-                        preparation_command(&inner.profile, &state, Some(&context))
-                    })
-            } else {
-                None
-            }
-        );
+        value["room_clean_preparation"] = json!(if room_selection
+            && inner.pending_intent.is_none()
+            && inner.state.fresh(Instant::now())
+            && inner
+                .mop_settings
+                .as_ref()
+                .is_some_and(|store| store.healthy())
+        {
+            crate::control::StatePredicate::from_status(&value["status"])
+                .zip(crate::control::MopContext::from_status(&value["status"]))
+                .and_then(|(state, context)| {
+                    preparation_command(&inner.profile, &state, Some(&context))
+                })
+        } else {
+            None
+        });
         value["motion_intent_unresolved"] = json!(inner.pending_intent.is_some());
         value["motion_persistence_ready"] = json!(inner.motion_ready());
         value
@@ -317,7 +342,7 @@ impl Engine {
     pub async fn publish(&self) {
         self.publish_with_time(None).await;
     }
-    
+
     async fn publish_with_time(&self, pose_time: Option<Instant>) {
         let mut inner = self.inner.lock().await;
         let now = pose_time.unwrap_or_else(Instant::now);
@@ -326,7 +351,8 @@ impl Engine {
         }
         if !inner.strict_status_fresh(now)
             || inner.trail.last_join.as_ref().is_some_and(|(_, at)| {
-                now.checked_duration_since(*at).is_none_or(|age| age >= TRAIL_JOIN_TTL)
+                now.checked_duration_since(*at)
+                    .is_none_or(|age| age >= TRAIL_JOIN_TTL)
             })
         {
             inner.trail.break_segment();
@@ -342,7 +368,7 @@ impl Engine {
     pub async fn event(&self, event: Event) {
         self.event_with_time(event, None).await;
     }
-    
+
     async fn event_with_time(&self, event: Event, pose_time: Option<Instant>) {
         let mut inner = self.inner.lock().await;
         let now = pose_time.unwrap_or_else(Instant::now);
@@ -363,7 +389,9 @@ impl Engine {
                 image_changed = true;
             }
             Event::Status { generation, result }
-                if inner.state.generation == generation && inner.state.connected && result.is_object() =>
+                if inner.state.generation == generation
+                    && inner.state.connected
+                    && result.is_object() =>
             {
                 // A missing status interval can hide an entire task boundary.
                 if !inner.strict_status_fresh(now) && !inner.trail.ended {
@@ -375,9 +403,8 @@ impl Engine {
             Event::Map { generation, result }
                 if inner.state.generation == generation && inner.state.connected =>
             {
-                match crate::maps::parse(&result) {
-                    Ok(map) => {
-                        inner.map = Some(map);
+                match inner.accept_editor_map(result, true) {
+                    Ok(()) => {
                         inner.map_generation = Some(generation);
                         inner.map_error = None;
                         inner.clear_pose();
@@ -410,9 +437,8 @@ impl Engine {
         self.publish_with_time(pose_time).await;
     }
     pub async fn load_map(&self, value: &Value) -> Result<(), String> {
-        let map = crate::maps::parse(value)?;
         let mut inner = self.inner.lock().await;
-        inner.map = Some(map);
+        inner.accept_editor_map(value.clone(), false)?;
         inner.map_generation = None;
         inner.map_error = None;
         inner.clear_pose();
@@ -428,6 +454,11 @@ impl Engine {
     pub async fn configure_map_display(&self, display: crate::maps::MapDisplay) {
         let mut inner = self.inner.lock().await;
         inner.map_display = display;
+        if let Some(raw) = inner.raw_map.clone() {
+            if let Err(error) = inner.accept_editor_map(raw, false) {
+                inner.map_error = Some(error);
+            }
+        }
         self.images.send_replace(inner.map_png(Instant::now()).ok());
         drop(inner);
         self.publish().await;
@@ -435,7 +466,7 @@ impl Engine {
     pub async fn map_png(&self) -> Result<Vec<u8>, String> {
         self.map_png_with_time(None).await
     }
-    
+
     async fn map_png_with_time(&self, pose_time: Option<Instant>) -> Result<Vec<u8>, String> {
         let inner = self.inner.lock().await;
         inner.map_png(pose_time.unwrap_or_else(Instant::now))
@@ -496,7 +527,8 @@ impl Engine {
             .map_err(|_| uncertain("request_timeout"))?
             .map_err(|_| uncertain("robot_disconnected"))?
             .map_err(|message| RequestFailure {
-                before_send: message == "session_disconnected_before_send",
+                before_send: message == "session_disconnected_before_send"
+                    || message.starts_with("before_send_refused"),
                 message,
             })
     }
@@ -540,18 +572,42 @@ impl Engine {
                 return Err("robot_disconnected".into());
             }
             let generation = inner.state.generation;
-            let counters = inner.pose_diagnostics.as_ref()
+            let counters = inner
+                .pose_diagnostics
+                .as_ref()
                 .filter(|(attached, _)| *attached == generation)
                 .map(|(_, diagnostics)| diagnostics.snapshot())
                 .unwrap_or(Value::Null);
             (generation, counters)
         };
-        let mut result = self.request_for(Some(generation), Operation::RequestPositions).await?;
-        result.as_object_mut().ok_or("position_request_receipt_refused")?
+        let mut result = self
+            .request_for(Some(generation), Operation::RequestPositions)
+            .await?;
+        result
+            .as_object_mut()
+            .ok_or("position_request_receipt_refused")?
             .insert("pose_counters_before".into(), counters);
         Ok(result)
     }
     pub async fn command(&self, input: CommandInput) -> Result<Value, String> {
+        self.command_bound(input, None).await
+    }
+    pub async fn room_command(
+        &self,
+        input: CommandInput,
+        map_id: String,
+        revision: String,
+    ) -> Result<Value, String> {
+        if input.command != "start" || input.mop.is_none() {
+            return Err("room_selection_invalid".into());
+        }
+        self.command_bound(input, Some((map_id, revision))).await
+    }
+    async fn command_bound(
+        &self,
+        input: CommandInput,
+        binding: Option<(String, String)>,
+    ) -> Result<Value, String> {
         // The owner is detached from HTTP/MQTT caller cancellation. Its lock and
         // unresolved intent cannot disappear because a browser stops waiting.
         let guard = match self.serial.clone().try_lock_owned() {
@@ -565,7 +621,7 @@ impl Engine {
         let command = input.command.clone();
         let result = tokio::spawn(async move {
             let _guard = guard;
-            engine.command_owned(input).await
+            engine.command_owned(input, binding).await
         })
         .await
         .map_err(|_| "command_owner_failed".to_string())?;
@@ -585,12 +641,26 @@ impl Engine {
         }));
         self.publish().await;
     }
-    async fn command_owned(&self, mut input: CommandInput) -> Result<Value, String> {
+    async fn command_owned(
+        &self,
+        mut input: CommandInput,
+        mut binding: Option<(String, String)>,
+    ) -> Result<Value, String> {
         if ["end_task", "vacuum_end_task", "vacuum_start"].contains(&input.command.as_str()) {
             return Err("internal_command_only".into());
         }
         let (profile, rooms, mop_configured) = {
             let inner = self.inner.lock().await;
+            if input.command == "start"
+                && binding.is_none()
+                && inner.map_generation == Some(inner.state.generation)
+            {
+                binding = inner.editor.catalog["map_id"]
+                    .as_str()
+                    .zip(inner.editor.catalog["revision"].as_str())
+                    .map(|(id, revision)| (id.into(), revision.into()));
+            }
+            inner.check_room_binding(binding.as_ref())?;
             if !inner.motion_ready() {
                 return Err(if inner.intent_store.is_some() {
                     "motion_persistence_failed"
@@ -598,6 +668,9 @@ impl Engine {
                     "motion_persistence_required"
                 }
                 .into());
+            }
+            if input.command == "start" && !inner.editor.motion_ready() {
+                return Err("room_catalog_unavailable_or_write_pending".into());
             }
             if !crate::control::eligible(&inner.profile, &input.command) {
                 return Err("command_guards_unverified".into());
@@ -709,8 +782,14 @@ impl Engine {
         let mut preparation = None;
         let prepare = (input.mop.is_some()
             && ["start", "vacuum_start"].contains(&input.command.as_str()))
-            .then(|| preparation_command(&profile, &observation.state, observation.mop_context.as_ref()))
-            .flatten();
+        .then(|| {
+            preparation_command(
+                &profile,
+                &observation.state,
+                observation.mop_context.as_ref(),
+            )
+        })
+        .flatten();
         if let Some(prepare) = prepare {
             // This stays inside the detached serial owner. A selector change
             // cannot alter the already validated plan, and a restart never
@@ -727,6 +806,7 @@ impl Engine {
                     },
                     &rooms,
                     observation,
+                    binding.as_ref(),
                 )
                 .await?;
             let Some(idle) =
@@ -736,7 +816,8 @@ impl Engine {
                     "vacuum_end_task_not_cleared"
                 } else {
                     "mop_end_task_not_cleared"
-                }.into());
+                }
+                .into());
             };
             preparation = Some(receipt);
             observation = idle;
@@ -774,7 +855,7 @@ impl Engine {
             return Err("mop_pause_requires_active_task".into());
         }
         let (mut result, _) = self
-            .command_step(&profile, &input, &rooms, observation)
+            .command_step(&profile, &input, &rooms, observation, binding.as_ref())
             .await?;
         if vacuum {
             result["command"] = json!("start");
@@ -797,9 +878,11 @@ impl Engine {
         input: &CommandInput,
         rooms: &[u64],
         observation: CommandObservation,
+        binding: Option<&(String, String)>,
     ) -> Result<(Value, Option<CommandObservation>), String> {
         {
             let mut inner = self.inner.lock().await;
+            inner.check_room_binding(binding)?;
             if let Some(pending) = &inner.pending_intent {
                 if !pending.accepts(&observation) {
                     return Err("previous_motion_intent_unresolved".into());
@@ -836,11 +919,14 @@ impl Engine {
         };
         // Audit the validated, frozen request and its rendered wire order.
         // These describe intent, not room coverage or transport success.
-        let requested = input.mop.as_ref()
+        let requested = input
+            .mop
+            .as_ref()
             .filter(|_| ["start", "vacuum_start"].contains(&input.command.as_str()))
             .map(|plan| (json!(plan.rooms), params["clean_order"].clone()));
         {
             let mut inner = self.inner.lock().await;
+            inner.check_room_binding(binding)?;
             inner.pending_intent = Some(PendingIntent {
                 command: input.command.clone(),
                 observation: Some(observation.clone()),
@@ -937,7 +1023,10 @@ impl Engine {
                         break;
                     }
                     if input.command == "vacuum_end_task"
-                        && after.mop_context.as_ref().is_none_or(|context| context.clean_mode != 2)
+                        && after
+                            .mop_context
+                            .as_ref()
+                            .is_none_or(|context| context.clean_mode != 2)
                     {
                         break;
                     }
@@ -973,7 +1062,8 @@ impl Engine {
                             "same_generation":true,"newer_revision":true
                         });
                         if input.command == "vacuum_end_task" {
-                            result["task_clear_proof"]["source_order"] = json!(observation.clean_order);
+                            result["task_clear_proof"]["source_order"] =
+                                json!(observation.clean_order);
                             result["task_clear_proof"]["target_order"] = json!(after.clean_order);
                         }
                     }
@@ -999,7 +1089,8 @@ impl Engine {
 }
 impl Inner {
     fn clear_cleaning_history(&mut self) -> bool {
-        let changed = self.trail.clear() || self.clean_layer.is_some() || self.clean_layer_error.is_some();
+        let changed =
+            self.trail.clear() || self.clean_layer.is_some() || self.clean_layer_error.is_some();
         self.clean_layer = None;
         self.clean_layer_received_at = None;
         self.clean_layer_error = None;
@@ -1011,19 +1102,30 @@ impl Inner {
         }
         // The layer may arrive during a wash or pause in the same observed job.
         // Initial dock telemetry cannot seed a new job's coverage.
-        let context = self.state.status.as_ref().and_then(crate::control::MopContext::from_status);
+        let context = self
+            .state
+            .status
+            .as_ref()
+            .and_then(crate::control::MopContext::from_status);
         if !context.is_some_and(|context| {
             self.trail.kind == Some((context.clean_mode, context.main_task))
                 && matches!(context.main_task, 1 | 2)
         }) {
             return;
         }
-        let Some(pose) = self.fresh_pose(now) else { return };
+        let Some(pose) = self.fresh_pose(now) else {
+            return;
+        };
         if pose.get("show_layer").is_none() {
             return;
         }
         match crate::maps::parse_reported_clean_layer(pose) {
-            Ok(layer) if self.map.as_ref().is_some_and(|map| layer.matches_wire_map(map)) => {
+            Ok(layer)
+                if self
+                    .map
+                    .as_ref()
+                    .is_some_and(|map| layer.matches_wire_map(map)) =>
+            {
                 self.clean_layer = Some(layer);
                 self.clean_layer_received_at = Some(now);
                 self.clean_layer_error = None;
@@ -1063,9 +1165,11 @@ impl Inner {
         })
     }
     fn strict_status_fresh(&self, now: Instant) -> bool {
-        self.state.connected && self.state.updated.is_some_and(|at| {
-            now.checked_duration_since(at).is_some_and(|age| age < POSE_DISPLAY_TTL)
-        })
+        self.state.connected
+            && self.state.updated.is_some_and(|at| {
+                now.checked_duration_since(at)
+                    .is_some_and(|age| age < POSE_DISPLAY_TTL)
+            })
     }
     fn floor_kind(&self, now: Instant) -> Option<(u16, u16)> {
         if !self.strict_status_fresh(now) {
@@ -1079,7 +1183,10 @@ impl Inner {
             && tuple.error_code == 0
             && matches!(context.main_task, 1 | 2)
             && status.get("task_name").and_then(Value::as_str) == Some("RoomClean")
-            && matches!((tuple.robot_status, context.clean_mode), (300, 2) | (302, 3)))
+            && matches!(
+                (tuple.robot_status, context.clean_mode),
+                (300, 2) | (302, 3)
+            ))
         .then_some((context.clean_mode, context.main_task))
     }
     fn observe_trail_status(&mut self, now: Instant) -> bool {
@@ -1104,10 +1211,13 @@ impl Inner {
         if self.trail.ended
             && status.get("task_name").and_then(Value::as_str) == Some("RoomClean")
             && crate::control::StatePredicate::from_status(status).is_some_and(|tuple| {
-                tuple.robot_status == 406 && tuple.work_status == 1
-                    && tuple.station_contact && tuple.error_code == 0
+                tuple.robot_status == 406
+                    && tuple.work_status == 1
+                    && tuple.station_contact
+                    && tuple.error_code == 0
             })
-            && crate::control::MopContext::from_status(status).is_some_and(|context| context.main_task == 1)
+            && crate::control::MopContext::from_status(status)
+                .is_some_and(|context| context.main_task == 1)
         {
             return self.clear_cleaning_history();
         }
@@ -1127,7 +1237,9 @@ impl Inner {
         false
     }
     fn record_trail_pose(&mut self, now: Instant) {
-        let point = self.floor_kind(now).zip(self.current_map().then_some(()))
+        let point = self
+            .floor_kind(now)
+            .zip(self.current_map().then_some(()))
             .and_then(|(kind, ())| {
                 let pose = self.fresh_pose(now)?;
                 let point = crate::maps::Point {
@@ -1146,9 +1258,14 @@ impl Inner {
         }
         self.trail.kind = Some(kind);
         self.trail.ended = false;
-        if self.trail.last_join.as_ref().is_some_and(|(previous,_)| {
-            self.map.as_ref().and_then(|map|map.world_pixel(previous.x,previous.y))
-                .is_none_or(|(x,y)| (pixel.0-x).abs().max((pixel.1-y).abs()) > crate::maps::MAX_TRAIL_JOIN_PIXELS)
+        if self.trail.last_join.as_ref().is_some_and(|(previous, _)| {
+            self.map
+                .as_ref()
+                .and_then(|map| map.world_pixel(previous.x, previous.y))
+                .is_none_or(|(x, y)| {
+                    (pixel.0 - x).abs().max((pixel.1 - y).abs())
+                        > crate::maps::MAX_TRAIL_JOIN_PIXELS
+                })
         }) {
             self.trail.break_segment();
         }
@@ -1163,7 +1280,8 @@ impl Inner {
             "stale"
         } else if self.floor_kind(now).is_some()
             && self.trail.last_join.as_ref().is_some_and(|(_, at)| {
-                now.checked_duration_since(*at).is_some_and(|age| age < TRAIL_JOIN_TTL)
+                now.checked_duration_since(*at)
+                    .is_some_and(|age| age < TRAIL_JOIN_TTL)
             })
         {
             "collecting"
@@ -1339,5 +1457,3 @@ impl Inner {
         Ok(())
     }
 }
-
-

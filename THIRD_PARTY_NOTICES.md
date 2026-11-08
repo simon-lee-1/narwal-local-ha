@@ -284,13 +284,43 @@ SOFTWARE.
 
 - Project: [PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card).
 - Frontend compatibility exercised with HACS release `v2.4.1`. Source revision `045c3ac946d4ef0a01201f306e9949643984a155` was inspected for the configuration interface; it is not represented as the release tag.
-- Role: unchanged interactive room selection, zoom, external repeat controls, icon actions and the MQTT service-call schema. This repository provides a Rust configuration generator and native Narwal map rendering; it does not vendor or modify the card's compiled bundle or source.
-- Install the frontend separately through HACS. Source license: MIT. Exact text follows.
+- Role: interactive room selection, zoom, repeat controls, icon actions and the MQTT service-call schema. This repository includes a narrowly patched frontend resource for live room catalogs and two-point split lines, plus its source patch and reproducible build instructions in `deploy/dashboard/FRONTEND.md`. The backend and configuration generator are Rust. Dependency notices for the bundled resource are in `deploy/dashboard/resources/FRONTEND-LICENSES.txt`.
+- Install the included frontend resource as described in the dashboard instructions. Source license: MIT. Exact text follows.
 
 ```text
 MIT License
 
 Copyright (c) 2021 Piotr Machowski
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## Config Template Card
+
+- Project: [custom-cards/config-template-card](https://github.com/custom-cards/config-template-card), source revision `17a4d22b76b011f45569901d98f0c5c5114d431d`, frontend version `1.3.6`.
+- Used only for the editor's Save and Cancel buttons to bind the displayed draft identifier. Installed separately through HACS; no source or compiled resource is bundled here.
+- Source license: MIT. Exact text follows.
+
+```text
+MIT License
+
+Copyright (c) 2019 Ian Richardson
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal

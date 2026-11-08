@@ -1,20 +1,38 @@
 # Interactive local map dashboard
 
-The dashboard uses the unchanged
+The dashboard builds on
 [Xiaomi Vacuum Map Card](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card),
-tested with **v2.4.1**, and the bridge's local MQTT entities. It needs no Xiaomi,
+with the included `room_source` patch and the bridge's local MQTT entities. It needs no Xiaomi,
 Dreame or Narwal cloud integration.
 
-Install the card through HACS and register its frontend resource following
-the card's instructions. Enable the standard Home Assistant MQTT integration
-and first verify the bridge's discovered entities and native map image.
+## Frontend resources
+
+Copy [resources/xiaomi-vacuum-map-card.js](resources/xiaomi-vacuum-map-card.js)
+to `/config/www/narwal/xiaomi-vacuum-map-card.js` on your HA installation.
+Register `/local/narwal/xiaomi-vacuum-map-card.js` as a JavaScript module
+resource. Use this resource in place of the original Xiaomi card resource;
+loading both registers the same custom element twice.
+
+Install [Config Template Card](https://github.com/custom-cards/config-template-card)
+**v1.3.6** through HACS and register its module resource. It is used only for
+the two draft action buttons. The live maps use the Xiaomi card directly.
+See [FRONTEND.md](FRONTEND.md) for source pins, checksums, build and license details.
+
+Enable the standard Home Assistant MQTT integration and verify the discovered
+entities and native map image. Update the bridge before opening the editor.
+Enable its private `room_editor_file` store as described in
+[ROOM_EDITOR.md](../../docs/ROOM_EDITOR.md).
+A missing custom-card error means one of these resources has not loaded;
+check its module resource entry and reload the browser.
 
 ## Generate your private configuration
 
 Room outlines and the map ID belong to your installation. The Rust helper
-reads a current `/api/state` snapshot and an entity mapping; it produces a
-complete dashboard JSON file. It makes no network requests, changes no
-settings and sends no robot commands.
+checks a current `/api/state` snapshot and an entity mapping; it produces a
+complete dashboard JSON file with Cleaning and Rooms views. The dashboard
+reads room geometry from the local catalog entity, so the generated file
+does not freeze a copy of the floorplan. The helper makes no network requests,
+changes no settings and sends no robot commands.
 
 Build it from the repository root:
 
@@ -40,6 +58,12 @@ discovered HA entities and `topic_prefix` matches your bridge configuration.
 The example IDs are placeholders. The initial vacuum object ID may include
 the MQTT client ID; copying the example without checking it is insufficient.
 The map entity must be the discovered native **image** entity.
+The mapping also needs the room catalog/status sensors, proposed-name text,
+split-room selector and draft-preview image discovered by the editor backend.
+New editor discovery object IDs use `narwal_j1_<client_id>_` followed by
+`room_catalog`, `room_editor`, `room_name`, `editor_room` or `room_edit_preview`.
+HA normalizes these into entity IDs and may retain an existing name, so copy
+the actual IDs shown in HA rather than constructing them from this pattern.
 
 Generate immediately after taking the snapshot:
 
@@ -95,16 +119,43 @@ The robot's reported progress and cleaned area may reset or retain previous
 values after docking. The dashboard does not replace them with an invented
 100%. Cleaning shading can remain visible after the task ends.
 
-## Room changes and request contract
+## Edit rooms
 
-Regenerate after splitting, merging or renaming rooms, replacing a map,
-changing the configured room catalog, or changing display orientation.
-The dashboard pins the current map ID; a replaced ID is rejected. In-place
-geometry changes may retain that ID, so the pin alone cannot detect them.
+Open the **Rooms** view:
+
+The backend validates each rename, split and merge before offering Save.
+Room names are local aliases for the HA map and controls.
+
+1. **Rename:** enter the new room name, choose Rename mode and select one room.
+2. **Merge:** choose Merge mode and select two adjacent rooms.
+3. **Split:** choose the target in **Room to split**, choose Split mode, then
+   place two points defining the dividing line.
+
+Press **▶** to prepare one draft. Review the backend's summary, feedback and
+**Draft preview**, then choose **Save** or **Cancel draft**. Selection and
+typing do not alter the map. Clear selection removes only the current map
+selection; Cancel discards the prepared draft.
+
+Save appears for a ready draft and is inactive if the backend's `can_save`
+flag is false. The backend independently rechecks every request. Unsupported
+operations, a disconnected robot, a changed map and an unavailable writer
+produce visible feedback rather than an apparent successful edit. Saving
+stays pending until the backend verifies its result.
+
+Complete or cancel one draft before preparing another. After a confirmed
+split, select the newly created room to prepare its name as a separate edit.
+See [the editor contract](../../docs/ROOM_EDITOR.md).
+
+## Room changes and cleaning requests
+
+Confirmed room edits automatically update outlines in both views. A changed
+catalog, map or display orientation clears old selections; pose and progress
+updates preserve them. Regenerate only when entity IDs or dashboard
+configuration change.
 
 The generated card publishes to `<topic_prefix>/command/room_clean` with
-QoS 0 and `retain: false`. It sends the current map ID, selected numeric room
-IDs, requested pass count and dampness. Explicit map selection does not change
+QoS 0 and `retain: false`. It sends the current catalog's map ID and revision,
+selected numeric room IDs, requested pass count and dampness. Explicit map selection does not change
 the bridge's saved next-clean selectors. This prevents an unrelated saved
 room selection from replacing the rooms selected on the map.
 

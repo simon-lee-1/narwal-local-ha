@@ -6,6 +6,7 @@ mod intent;
 pub mod maps;
 pub mod mqtt;
 pub mod plan;
+pub mod room_editor;
 pub mod runtime;
 pub mod session;
 pub mod state;

@@ -67,6 +67,9 @@ omits it. The payload is limited to 2048 bytes. Use QoS 0 and `retain: false`.
 Unknown/duplicate fields, malformed values, retained messages and duplicate
 MQTT deliveries are rejected.
 
+Room editing uses separate `room_editor` topics and a draft/Save workflow.
+It never reuses the cleaning command topic. See [ROOM_EDITOR.md](ROOM_EDITOR.md).
+
 Explicit map requests freeze their own plan without changing saved selectors.
 Ordinary `vacuum.start` uses the saved plan for a new task, or resumes the
 existing paused Mop task without replacing its rooms. Changing a setting

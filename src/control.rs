@@ -284,9 +284,25 @@ pub struct CommandInput {
 #[derive(Clone, Debug)]
 pub enum LocalInput {
     Command(CommandInput),
+    RoomCommand {
+        command: CommandInput,
+        map_id: String,
+        revision: String,
+    },
     SelectRoom(String),
     SetPasses(u8),
     SetDampness(crate::plan::Dampness),
+    Editor(crate::engine::EditorInput),
+    EditorName(String),
+    EditorRoom(String),
+}
+impl LocalInput {
+    fn is_action(&self) -> bool {
+        matches!(
+            self,
+            Self::Command(_) | Self::RoomCommand { .. } | Self::Editor(_)
+        )
+    }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -344,7 +360,7 @@ where
     Fut: std::future::Future<Output = ()>,
 {
     while let Some(input) = rx.recv().await {
-        if !matches!(input, LocalInput::Command(_)) {
+        if !input.is_action() {
             run(input).await;
             continue;
         }
@@ -354,14 +370,14 @@ where
             tokio::select! {
                 _ = &mut action => {
                     while let Ok(extra) = rx.try_recv() {
-                        if !matches!(extra, LocalInput::Command(_)) {
+                        if !extra.is_action() {
                             run(extra).await;
                         }
                     }
                     break;
                 }
                 extra = rx.recv() => match extra {
-                    Some(LocalInput::Command(_)) => {},
+                    Some(action) if action.is_action() => {},
                     Some(setting) => run(setting).await,
                     None => { action.await; return; }
                 }
@@ -389,5 +405,3 @@ pub fn prepare(
         Decision::NoOp => Err("no_action_needed".into()),
     }
 }
-
-

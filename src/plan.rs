@@ -125,6 +125,29 @@ impl Store {
     pub(crate) fn healthy(&self) -> bool {
         !self.failed
     }
+    pub(crate) fn replace_catalog(&mut self, rooms: Vec<Room>) -> Result<(), String> {
+        if self.failed {
+            return Err("mop_settings_persistence_failed".into());
+        }
+        let mut next = self.settings.clone();
+        next.rooms = rooms;
+        next.selected
+            .rooms
+            .retain(|id| next.rooms.iter().any(|room| room.id == *id));
+        if next.selected.rooms.is_empty() {
+            next.selected.rooms = vec![next.rooms.first().ok_or("room_catalog_empty")?.id];
+        }
+        next.validate()?;
+        if next == self.settings {
+            return Ok(());
+        }
+        if let Err(error) = self.persist(&next) {
+            self.failed = true;
+            return Err(error);
+        }
+        self.settings = next;
+        Ok(())
+    }
     pub(crate) fn update(&mut self, change: Change) -> Result<(), String> {
         if self.failed {
             return Err("mop_settings_persistence_failed".into());
@@ -200,5 +223,3 @@ impl Store {
         result
     }
 }
-
-

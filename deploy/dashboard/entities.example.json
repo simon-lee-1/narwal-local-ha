@@ -9,5 +9,10 @@
   "area_entity": "sensor.narwal_j1_cleaned_area",
   "dock_entity": "binary_sensor.narwal_j1_docked",
   "error_entity": "sensor.narwal_j1_error_code",
-  "dampness_entity": "select.narwal_j1_mop_dampness"
+  "dampness_entity": "select.narwal_j1_mop_dampness",
+  "room_catalog_entity": "sensor.narwal_j1_room_catalog",
+  "room_editor_entity": "sensor.narwal_j1_room_editor",
+  "room_name_entity": "text.narwal_j1_room_name",
+  "editor_room_entity": "select.narwal_j1_editor_room",
+  "room_preview_entity": "image.narwal_j1_room_edit_preview"
 }

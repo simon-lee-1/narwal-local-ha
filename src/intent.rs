@@ -53,6 +53,33 @@ fn profile_hash(profile: &CommandProfile) -> Result<String, String> {
         .map(|byte| format!("{byte:02x}"))
         .collect())
 }
+fn validate_record(record: &Record, profile: &CommandProfile) -> Result<(), String> {
+    if record.schema != 1
+        || record.profile_sha256 != profile_hash(profile)?
+        || record
+            .pending
+            .as_ref()
+            .is_some_and(|pending| !crate::control::eligible(profile, &pending.command))
+    {
+        return Err(error());
+    }
+    Ok(())
+}
+/// Read-only deployment preflight. Never creates the store's lock or record.
+pub(crate) fn validate_existing(path: &Path, profile: &CommandProfile) -> Result<(), String> {
+    let parent = path.parent().ok_or_else(error)?;
+    let meta = std::fs::symlink_metadata(parent).map_err(|_| error())?;
+    let file = std::fs::symlink_metadata(path).map_err(|_| error())?;
+    if meta.mode() & 0o7777 != 0o700 || file.mode() & 0o7777 != 0o600 {
+        return Err(error());
+    }
+    let bytes = crate::runtime::private_read(path)?;
+    if bytes.len() as u64 > MAX_RECORD {
+        return Err(error());
+    }
+    let record: Record = serde_json::from_slice(&bytes).map_err(|_| error())?;
+    validate_record(&record, profile)
+}
 fn private_file(file: &File) -> Result<(), String> {
     let meta = file.metadata().map_err(|_| error())?;
     if !meta.is_file()
@@ -172,15 +199,7 @@ impl Store {
     pub(crate) fn open(path: &Path, profile: &CommandProfile) -> Result<Self, String> {
         let mut store = Self::locked(path, profile)?;
         let record = store.read()?;
-        if record.schema != 1
-            || record.profile_sha256 != store.record.profile_sha256
-            || record
-                .pending
-                .as_ref()
-                .is_some_and(|pending| !crate::control::eligible(profile, &pending.command))
-        {
-            return Err(error());
-        }
+        validate_record(&record, profile)?;
         store.record = record;
         Ok(store)
     }
@@ -295,5 +314,3 @@ impl Store {
         result
     }
 }
-
-

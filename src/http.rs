@@ -109,6 +109,10 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/map/refresh", post(refresh_map))
         .route("/api/telemetry/request_positions", post(request_positions))
         .route("/api/command", post(command))
+        .route("/api/room-editor", post(room_editor))
+        .route("/api/room-editor/name", post(editor_name))
+        .route("/api/room-editor/room", post(editor_room))
+        .route("/room-edit-preview.png", get(editor_image))
         .layer(middleware::from_fn_with_state(app.clone(), guard))
         .with_state(app)
 }
@@ -148,7 +152,8 @@ async fn request_positions(State(app): State<Arc<App>>, Json(input): Json<Value>
         return (
             StatusCode::UNPROCESSABLE_ENTITY,
             Json(json!({"error":"empty_object_required"})),
-        ).into_response();
+        )
+            .into_response();
     }
     operation_response(app.engine.request_positions().await)
 }
@@ -157,6 +162,39 @@ async fn command(
     Json(input): Json<crate::control::CommandInput>,
 ) -> Response {
     operation_response(app.engine.command(input).await)
+}
+async fn room_editor(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::engine::EditorInput>,
+) -> Response {
+    operation_response(app.engine.room_editor(input).await)
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct EditorSetting {
+    value: String,
+}
+async fn editor_name(State(app): State<Arc<App>>, Json(input): Json<EditorSetting>) -> Response {
+    operation_response(
+        app.engine
+            .editor_name(input.value)
+            .await
+            .map(|_| json!({"saved":false})),
+    )
+}
+async fn editor_room(State(app): State<Arc<App>>, Json(input): Json<EditorSetting>) -> Response {
+    operation_response(
+        app.engine
+            .editor_room(input.value)
+            .await
+            .map(|_| json!({"saved":false})),
+    )
+}
+async fn editor_image(State(app): State<Arc<App>>) -> Response {
+    match app.engine.room_edit_preview().await {
+        Ok(bytes) => ([(axum::http::header::CONTENT_TYPE, "image/png")], bytes).into_response(),
+        Err(_) => StatusCode::NOT_FOUND.into_response(),
+    }
 }
 pub async fn run(engine: Engine, address: SocketAddr) -> Result<(), String> {
     local_address(address)?;
@@ -273,5 +311,3 @@ $("refresh").addEventListener("click",()=>send("/api/refresh",{}));$("read-map")
 $("map-image").addEventListener("error",()=>{$("map-stage").hidden=true;$("map-empty").hidden=false;$("map-caption").textContent="Map image unavailable";lastImageKey="";});
 load();setInterval(load,3000);
 </script></body></html>"##;
-
-

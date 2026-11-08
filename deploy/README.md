@@ -41,6 +41,10 @@ verified room for the first supervised run. Catalogs accept 1–32 unique IDs
 from 0 to 255, unique labels up to 128 UTF-8 bytes, and a selected subset.
 `passes` is 1–3; `dampness` is exactly `Normal` or `Wet`.
 
+These settings supply the initial catalog. Once a current robot map arrives,
+its room IDs and names become authoritative. Use the Rooms editor to save
+HA-local names; those aliases persist across map refreshes.
+
 If room IDs are not yet known, the example catalog can be used to establish
 the initial connection only. Leave all cleaning controls untouched, inspect
 the local map, then stop the service and replace the catalog as described below
@@ -70,6 +74,7 @@ It installs the executable and a canonical root-owned copy of socat in
 | `/var/lib/narwal-local-ha/profile.json` | Explicit source/feedback command contracts |
 | `/var/lib/narwal-local-ha/settings.json` | Durable room/pass/dampness selection |
 | `/var/lib/narwal-local-ha/intent.json` | Durable command journal; initialized once |
+| `/var/lib/narwal-local-ha/room-editor.json` | Private room aliases, draft and map-edit state |
 | `/var/lib/narwal-local-ha/key.pem` | Host-local generated TLS private key |
 | `/etc/narwal-local-ha/frontend.env` | Source-filtered TLS listener configuration |
 
@@ -129,17 +134,19 @@ owner/mode.
 
 ## Dashboard
 
-Install the unchanged Xiaomi Vacuum Map Card through HACS (tested with v2.4.1),
-then follow [dashboard/README.md](dashboard/README.md). The Rust helper generates
+Install the included patched Xiaomi map-card resource and Config Template Card
+as described in [dashboard/README.md](dashboard/README.md). The Rust helper generates
 an installation-specific dashboard from current local room metadata and an
-explicit HA entity/topic mapping. Keep that output private: it contains the
-floorplan and map identifier. No real map or pre-generated household dashboard
-is included in this repository.
+explicit HA entity/topic mapping. Its live room catalog supplies the current
+map identifier and outlines. No real map or pre-generated household dashboard
+is included in this repository. Keep runtime snapshots and generated files private.
 
 The card supports room-outline selection and Clear selection. Mop and Vacuum
 expose 1–3 requested passes. Mop also provides Normal/Wet dampness and
 Pause/Resume. Both offer Return to dock. Job phase, mode, battery, percentage,
 cleaned area and readable errors remain visible alongside the map.
+The Rooms view prepares names, splits and merges, displays the draft preview,
+and offers explicit Save/Cancel with backend capability and refusal feedback.
 
 The runtime renders fresh reported moving poses, a white base-station marker,
 plain room labels and darker reported cleaning coverage. With no fresh pose,
@@ -151,8 +158,8 @@ Optional `map_display` installation settings are `transform` (`identity`,
 `rotate180`, `flip_horizontal` or `flip_vertical`), `room_labels` and
 `show_trail`. Defaults are identity, labels enabled and the blue pose-history
 line hidden. The renderer transforms its PNG and exported room outlines
-together; the card uses identity calibration. Regenerate the dashboard after
-any orientation or room change. Hiding the trail preserves route telemetry,
+together; the card uses identity calibration. Catalog changes refresh outlines
+and clear stale selections automatically. Hiding the trail preserves route telemetry,
 cleaning shading and robot/base markers.
 
 For local diagnosis, `/api/state` exposes `pose_diagnostics`, current map and
@@ -181,6 +188,11 @@ six-operation profile does not enable that preparation. Compare installed
 profile and journal compatibility before an upgrade, preserve rollback material,
 and keep the service stopped if a migration has not been established. Never
 replace or reinitialize an unresolved journal to enable a new command.
+
+The current installer enables a private `room_editor_file`. Add that key to
+an existing installation's runtime configuration when enabling the editor;
+see [ROOM_EDITOR.md](../docs/ROOM_EDITOR.md). Preserve any existing editor
+store and its unresolved state.
 
 Regenerate the dashboard from fresh current-map metadata after the upgrade,
 preserving your entity/topic bindings. Verify job status, moving-position

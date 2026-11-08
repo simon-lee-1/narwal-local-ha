@@ -22,6 +22,11 @@ struct Entities {
     dock_entity: String,
     error_entity: String,
     dampness_entity: String,
+    room_catalog_entity: String,
+    room_editor_entity: String,
+    room_name_entity: String,
+    editor_room_entity: String,
+    room_preview_entity: String,
 }
 
 fn require(value: bool, message: &str) -> Result<(), String> {
@@ -63,6 +68,11 @@ fn validate_entities(e: &Entities) -> Result<(), String> {
         (&e.dock_entity, "binary_sensor"),
         (&e.error_entity, "sensor"),
         (&e.dampness_entity, "select"),
+        (&e.room_catalog_entity, "sensor"),
+        (&e.room_editor_entity, "sensor"),
+        (&e.room_name_entity, "text"),
+        (&e.editor_room_entity, "select"),
+        (&e.room_preview_entity, "image"),
     ] {
         require(
             valid_entity(entity, domain),
@@ -166,22 +176,15 @@ fn action(service: &str, e: &Entities) -> Value {
     json!({"action":"call-service","service":service,"service_data":{"entity_id":e.vacuum_entity}})
 }
 
-fn map_card(
-    mode: &str,
-    e: &Entities,
-    map_id: &str,
-    rooms: &[Value],
-    translations: &Value,
-) -> Value {
+fn map_card(mode: &str, e: &Entities, translations: &Value) -> Value {
     let mop = mode == "Mop";
     let handler = format!(
         "{}-{}-map",
         e.vacuum_entity.replace('.', "-"),
         mode.to_lowercase()
     );
-    let mut payload = format!(
-        "{{\"map_id\":{},\"rooms\":[[selection]],\"passes\":",
-        serde_json::to_string(map_id).expect("string serialization")
+    let mut payload = String::from(
+        "{\"map_id\":[[map_id_json]],\"revision\":[[map_revision_json]],\"rooms\":[[selection]],\"passes\":",
     );
     payload.push_str("[[repeats]]");
     payload.push_str(",\"dampness\":\"");
@@ -218,6 +221,7 @@ fn map_card(
         "type":"custom:xiaomi-vacuum-map-card","title":"Narwal J1",
         "action_handler_id":handler,"entity":e.vacuum_entity,
         "map_source":{"camera":e.map_entity},"calibration_source":{"identity":true},
+        "room_source":{"entity":e.room_catalog_entity},
         "map_locked":true,"two_finger_pan":true,"clean_selection_on_start":true,"debug":false,
         "icons":icons,
         "tiles":[
@@ -233,19 +237,152 @@ fn map_card(
         "map_modes":[{
             "name":if mop {"Mop rooms"} else {"Vacuum rooms"},
             "icon":"mdi:floor-plan","selection_type":"ROOM","id_type":"number",
-            "max_selections":rooms.len(),"repeats_type":"EXTERNAL",
+            "max_selections":32,"repeats_type":"EXTERNAL",
             "max_repeats":3,"run_immediately":false,
             "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":mop,
                 "service_data":{"topic":format!("{}/command/room_clean",e.topic_prefix),
                     "retain":false,"qos":0,"payload":payload}},
-            "predefined_selections":rooms
+            "predefined_selections":[]
         }]
     })
 }
 
+fn editor_view(e: &Entities) -> Value {
+    let handler = format!("{}-room-editor", e.vacuum_entity.replace('.', "-"));
+    let mut modes = Vec::new();
+    for (operation, name, icon, selection, count, field) in [
+        (
+            "rename",
+            "Rename · prepare draft",
+            "mdi:rename",
+            "ROOM",
+            1,
+            "rooms",
+        ),
+        (
+            "merge",
+            "Merge · prepare draft",
+            "mdi:vector-union",
+            "ROOM",
+            2,
+            "rooms",
+        ),
+        (
+            "split",
+            "Split · prepare draft",
+            "mdi:vector-line",
+            "MANUAL_PATH",
+            2,
+            "line",
+        ),
+    ] {
+        let payload = format!(
+            "{{\"operation\":\"{operation}\",\"map_id\":[[map_id_json]],\
+             \"revision\":[[map_revision_json]],\"{field}\":[[selection]]}}"
+        );
+        let mut mode = json!({
+            "name":name,"icon":icon,"selection_type":selection,"id_type":"number",
+            "max_selections":count,"repeats_type":"NONE","run_immediately":false,
+            "coordinates_rounding":false,
+            "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":false,
+                "service_data":{"topic":format!("{}/room_editor/draft",e.topic_prefix),
+                    "qos":0,"retain":false,"payload":payload}}
+        });
+        if selection == "ROOM" {
+            mode["predefined_selections"] = json!([]);
+        }
+        modes.push(mode);
+    }
+    let draft = format!("states['{}']?.attributes", e.room_editor_entity);
+    let save_guard = format!(
+        "states['{}']?.state === 'draft_ready' && {draft}?.can_save === true \
+         && typeof {draft}?.draft_id === 'string' && {draft}.draft_id.length > 0",
+        e.room_editor_entity
+    );
+    let cancel_guard = format!(
+        "['draft_ready','draft_blocked','refused'].includes(states['{}']?.state) \
+         && typeof {draft}?.draft_id === 'string' && {draft}.draft_id.length > 0",
+        e.room_editor_entity
+    );
+    let button = |save: bool| {
+        let operation = if save { "save" } else { "cancel" };
+        let guard = if save { &save_guard } else { &cancel_guard };
+        let action = format!("${{{guard} ? 'call-service' : 'none'}}");
+        json!({"type":"button","name":if save {"Save"} else {"Cancel draft"},
+            "icon":if save {"mdi:content-save"} else {"mdi:cancel"},
+            "tap_action":{"action":action,"service":"mqtt.publish","service_data":{
+                "topic":format!("{}/room_editor/{operation}",e.topic_prefix),
+                "qos":0,"retain":false,
+                "payload":format!("${{JSON.stringify({{draft_id: {draft}?.draft_id ?? ''}})}}")
+            }},
+            "hold_action":{"action":"none"},"double_tap_action":{"action":"none"}})
+    };
+    let actions = json!({
+        "type":"custom:config-template-card","entities":[e.room_editor_entity],
+        "card":{"type":"horizontal-stack","cards":[
+            {"type":"conditional","conditions":[
+                {"condition":"state","entity":e.room_editor_entity,"state":"draft_ready"}
+            ],"card":button(true)},button(false)
+        ]}
+    });
+    let cards = vec![
+        json!({"type":"conditional","conditions":[{"condition":"or","conditions":[
+            {"condition":"state","entity":e.room_editor_entity,"state":"unavailable"},
+            {"condition":"state","entity":e.room_editor_entity,"state":"unknown"}
+        ]}],"card":{"type":"markdown","title":"Room editor unavailable","content":
+            "Check the local bridge connection and room-editor setup. \
+             Edits cannot be saved until the editor reports ready."}}),
+        json!({"type":"markdown","content":
+            "**Prepare, review, then Save.** Rename: enter a new name and select one room. \
+             Merge: select two adjacent rooms. Split: choose the target room below, then mark \
+             two points for the dividing line in Split mode. Press ▶ to prepare the draft.\n\n\
+             Selection and text input do not change the saved map. Review the preview and feedback, \
+             then **Save** or **Cancel draft** before preparing another edit."}),
+        json!({"type":"entities","title":"Room edit","show_header_toggle":false,"entities":[
+            {"entity":e.room_name_entity,"name":"New room name"},
+            {"entity":e.editor_room_entity,"name":"Room to split"},
+            {"entity":e.room_editor_entity,"name":"Editor status"},
+            {"type":"attribute","entity":e.room_editor_entity,"attribute":"operation","name":"Operation"},
+            {"type":"attribute","entity":e.room_editor_entity,"attribute":"summary","name":"Draft"},
+            {"type":"attribute","entity":e.room_editor_entity,"attribute":"message","name":"Feedback"},
+            {"type":"attribute","entity":e.room_editor_entity,"attribute":"capabilities","name":"Available edits"}
+        ]}),
+        json!({"type":"custom:xiaomi-vacuum-map-card","title":"Room editor",
+            "entity":e.vacuum_entity,"action_handler_id":handler,
+            "map_source":{"camera":e.map_entity},"room_source":{"entity":e.room_catalog_entity},
+            "calibration_source":{"identity":true},"map_locked":true,"two_finger_pan":true,
+            "clean_selection_on_start":true,"debug":false,"tiles":[],
+            "icons":[{"icon":"mdi:selection-remove","tooltip":"Clear room or split-line selection",
+                "tap_action":{"action":"fire-dom-event","xiaomi_vacuum_map_card":{
+                    "action_handler_id":handler,"action":"selection.clear"}}}],
+            "map_modes":modes}),
+        json!({"type":"conditional","conditions":[
+            {"condition":"state","entity":e.room_editor_entity,"state_not":"idle"},
+            {"condition":"state","entity":e.room_editor_entity,"state_not":"unavailable"},
+            {"condition":"state","entity":e.room_preview_entity,"state_not":"unavailable"},
+            {"condition":"state","entity":e.room_preview_entity,"state_not":"unknown"}
+        ],"card":{"type":"picture-entity","entity":e.room_preview_entity,"name":"Draft preview",
+            "show_state":false,"show_name":true,"tap_action":{"action":"none"}}}),
+        actions,
+        json!({"type":"button","name":"Refresh result","icon":"mdi:refresh",
+            "tap_action":{"action":"call-service","service":"mqtt.publish","service_data":{
+                "topic":format!("{}/room_editor/refresh",e.topic_prefix),
+                "payload":"{}","qos":0,"retain":false}},
+            "hold_action":{"action":"none"},"double_tap_action":{"action":"none"}}),
+        json!({"type":"markdown","content":
+            "Save is available only when the backend reports a valid, supported draft. \
+             Refusals and an unavailable writer appear above. Saving stays pending until \
+             the backend verifies the resulting map. A confirmed edit refreshes room outlines \
+             and clears old selections in both views."}),
+    ];
+    json!({"title":"Rooms","path":"rooms","icon":"mdi:floor-plan",
+        "type":"sections","max_columns":2,"sections":[{"type":"grid","column_span":2,
+            "cards":[{"type":"vertical-stack","grid_options":{"columns":"full"},"cards":cards}]}]})
+}
+
 fn generate(state: &Value, e: &Entities) -> Result<Value, String> {
     validate_entities(e)?;
-    let (map_id, rooms) = current_rooms(state)?;
+    current_rooms(state)?;
     let mut translations: Value = serde_json::from_str(include_str!("../../error-labels.json"))
         .map_err(|_| "invalid packaged error labels")?;
     let labels =
@@ -275,7 +412,7 @@ fn generate(state: &Value, e: &Entities) -> Result<Value, String> {
             {"condition":"state","entity":e.vacuum_entity,"state_not":"unknown"},
             {"condition":"state","entity":e.map_entity,"state_not":"unavailable"},
             {"condition":"state","entity":e.map_entity,"state_not":"unknown"}
-        ],"card":map_card(mode, e, &map_id, &rooms, &translations)}));
+        ],"card":map_card(mode, e, &translations)}));
     }
     cards.push(json!({"type":"markdown","content":
         "**Tap a room area to select it; tap it again to remove it.** Check the highlighted rooms, then press ▶ to clean all selected rooms. **Clear room selection** removes every selection.\n\n\
@@ -283,7 +420,8 @@ fn generate(state: &Value, e: &Entities) -> Result<Value, String> {
     Ok(
         json!({"title":"Narwal","views":[{"title":"Narwal","path":"overview","icon":"mdi:robot-vacuum",
         "type":"sections","max_columns":2,"sections":[{"type":"grid","column_span":2,
-        "cards":[{"type":"vertical-stack","grid_options":{"columns":"full"},"cards":cards}]}]}]}),
+        "cards":[{"type":"vertical-stack","grid_options":{"columns":"full"},"cards":cards}]}]},
+        editor_view(e)]}),
     )
 }
 

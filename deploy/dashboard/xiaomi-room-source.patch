@@ -1,0 +1,167 @@
+--- /dev/null
++++ b/src/model/room-source.ts
+@@ -0,0 +1,48 @@
++import { RoomConfig } from "../types/types";
++
++export interface RoomSourceSnapshot {
++    key: string;
++    mapId: string;
++    revision: string;
++    rooms: RoomConfig[];
++}
++
++// MQTT attributes are data, never configuration or executable templates.
++export function readRoomSource(entity: { state: string; attributes: Record<string, unknown> } | undefined): RoomSourceSnapshot | undefined {
++    if (!entity || ["unknown", "unavailable"].includes(entity.state)) return undefined;
++    const { map_id: mapId, revision, rooms: rawRooms, coordinate_space: coordinateSpace } = entity.attributes;
++    const safePin = (value: unknown): value is string =>
++        typeof value === "string" && value.length > 0 && value.length <= 256 && /^[A-Za-z0-9_.:-]+$/.test(value);
++    if (!safePin(mapId) || !safePin(revision) || coordinateSpace !== "display_pixels"
++        || !Array.isArray(rawRooms) || rawRooms.length === 0 || rawRooms.length > 32) return undefined;
++    const ids = new Set<number>();
++    const rooms: RoomConfig[] = [];
++    for (const raw of rawRooms) {
++        if (raw === null || typeof raw !== "object") return undefined;
++        const { id, outline } = raw;
++        if (!Number.isInteger(id) || id < 0 || id > 255 || ids.has(id)
++            || !Array.isArray(outline) || outline.length < 3 || outline.length > 65536) return undefined;
++        const points: [number, number][] = [];
++        for (const point of outline) {
++            if (!Array.isArray(point) || point.length !== 2
++                || !point.every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 4096)) return undefined;
++            points.push([point[0], point[1]]);
++        }
++        ids.add(id);
++        let displayLabel: RoomConfig["label"];
++        const { name, label } = raw;
++        // ASCII names are already rasterized. Other names remain escaped SVG text.
++        if (typeof name === "string" && name.length > 0 && name.length <= 128
++            && /[^\x00-\x7f]/.test(name) && !/[\x00-\x1f\x7f-\x9f]/.test(name)
++            && label !== null && typeof label === "object") {
++            const { x, y } = label;
++            if ([x, y].every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 4096)) {
++                displayLabel = { text: name, x, y, offset_x: 0, offset_y: 0 };
++            }
++        }
++        // Ignore incoming label text/options, actions, variables and default selections.
++        rooms.push({ id, outline: points, default_state: "unselected" as RoomConfig["default_state"],
++            ...(displayLabel ? { label: displayLabel } : {}) });
++    }
++    return { key: JSON.stringify([mapId, revision, rooms]), mapId, revision, rooms };
++}
+--- a/src/types/types.ts
++++ b/src/types/types.ts
+@@ -58,6 +58,7 @@
+     readonly entity: string;
+     readonly vacuum_platform?: string;
+     readonly map_source: MapSourceConfig;
++    readonly room_source?: { readonly entity: string };
+     readonly map_locked?: boolean;
+     readonly two_finger_pan?: boolean;
+     readonly calibration_source?: CalibrationSourceConfig;
+--- a/src/utils.ts
++++ b/src/utils.ts
+@@ -67,6 +67,7 @@
+     if (config.entity) {
+         watchedEntities.add(config.entity);
+     }
++    if (config.room_source?.entity) watchedEntities.add(config.room_source.entity);
+     if (config.map_source.camera) {
+         watchedEntities.add(config.map_source.camera);
+     }
+--- a/src/xiaomi-vacuum-map-card.ts
++++ b/src/xiaomi-vacuum-map-card.ts
+@@ -81,6 +81,7 @@
+ import "./polyfills/objectEntries";
+ import "./polyfills/objectFromEntries";
+ 
++import { readRoomSource } from "./model/room-source";
+ import { DropdownMenu } from "./components/dropdown-menu";
+ import { TilesWrapper } from "./components/tiles-wrapper";
+ import { IconsWrapper } from "./components/icons-wrapper";
+@@ -148,6 +149,8 @@
+     private coordinatesConverter?: CoordinatesConverter;
+     private entitiesToManuallyUpdate: string[] = [];
+     private modes: MapMode[] = [];
++    private roomSourceKey?: string;
++    private roomSourceReady = false;
+     private shouldHandleMouseUp!: boolean;
+     private lastHassUpdate!: Date;
+     public isInEditor = false;
+@@ -173,6 +176,7 @@
+         if (firstHass) {
+             this._firstHass();
+         }
++        this._syncRoomSource();
+     }
+ 
+     public static async getConfigElement(): Promise<LovelaceCardEditor> {
+@@ -547,6 +551,8 @@
+         this.presetIndex = index;
+         this.currentPreset = config;
+         this.internalVariables = this._getInternalVariables(config);
++        this.roomSourceKey = undefined;
++        this._syncRoomSource(false);
+ 
+         this._getIconsAndTiles(config, this.internalVariables)
+             .then(([icons, tiles]) => this._setPreset({ ...config, tiles: tiles, icons: icons }))
+@@ -723,6 +729,26 @@
+ 
+     private _getMousePosition(event: MouseEvent | TouchEvent): MousePosition {
+         return getMousePosition(event, this._getSvgWrapper(), this.mapScale);
++    }
++
++    private _syncRoomSource(reset = true): boolean {
++        const source = this.currentPreset?.room_source;
++        if (!source) return false;
++        const snapshot = readRoomSource(this.hass?.states[source.entity]);
++        const key = snapshot?.key ?? "unavailable";
++        if (key === this.roomSourceKey) return false;
++        this.roomSourceKey = key;
++        this.roomSourceReady = snapshot !== undefined;
++        for (const mode of this.modes) {
++            if (mode.selectionType === SelectionType.ROOM) mode.predefinedSelections = snapshot?.rooms ?? [];
++        }
++        this.internalVariables = {
++            ...this.internalVariables,
++            map_id_json: JSON.stringify(snapshot?.mapId ?? null),
++            map_revision_json: JSON.stringify(snapshot?.revision ?? null),
++        };
++        if (reset) this._setCurrentMode(this.selectedMode, false);
++        return true;
+     }
+ 
+     private _setCurrentMode(newModeIndex: number, manual = true): void {
+@@ -1038,6 +1064,10 @@
+ 
+     private async _run(debug: boolean): Promise<void> {
+         const currentPreset = this._getCurrentPreset();
++        if (this._syncRoomSource() || (currentPreset.room_source && !this.roomSourceReady)) {
++            this._showToast("popups.no_selection", "mdi:close", false);
++            return;
++        }
+         const currentMode = this._getCurrentMode();
+         const { selection, variables } = this._getSelection(currentMode);
+         if ((selection as any[]).length == 0 || !currentMode) {
+@@ -1177,6 +1207,10 @@
+             const { x, y } = getMousePosition(event, this._getSvgWrapper(), 1);
+             switch (currentMode.selectionType) {
+                 case SelectionType.MANUAL_PATH:
++                    if (this.selectedManualPath.points.length >= currentMode.maxSelections) {
++                        forwardHaptic("failure");
++                        break;
++                    }
+                     forwardHaptic("selection");
+                     this.selectedManualPath.addPoint(x, y);
+                     this._selectionChanged();
+--- a/rollup.config.js
++++ b/rollup.config.js
+@@ -13,7 +13,7 @@
+     babel({
+         exclude: "node_modules/**",
+     }),
+-    terser(),
++    terser({ numWorkers: 1 }),
+ ];
+ 
+ export default [

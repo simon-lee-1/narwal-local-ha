@@ -131,7 +131,6 @@ pub struct RoomMap {
     room_outlines: Vec<DisplayRoomOutline>,
 }
 
-
 /// A bounded device-reported cleaning grid, independent of room-map geometry.
 #[derive(Clone)]
 pub struct CleanLayer {
@@ -247,7 +246,9 @@ fn parse_clean_layer_inner(
     })
 }
 impl CleanLayer {
-    pub fn matches_map(&self, map: &RoomMap) -> bool { self.map_id == map.map_id }
+    pub fn matches_map(&self, map: &RoomMap) -> bool {
+        self.map_id == map.map_id
+    }
 
     /// The saved wire data supplies the same ID as a plan-map decimal string
     /// and a pose u64. Match that lossless spelling without float conversion,
@@ -258,9 +259,9 @@ impl CleanLayer {
         }
         match (&self.map_id, &map.map_id) {
             (Value::String(text), Value::Number(number))
-            | (Value::Number(number), Value::String(text)) => {
-                number.as_u64().is_some_and(|number| *text == number.to_string())
-            }
+            | (Value::Number(number), Value::String(text)) => number
+                .as_u64()
+                .is_some_and(|number| *text == number.to_string()),
             _ => false,
         }
     }
@@ -291,8 +292,12 @@ impl CleanLayer {
         // transforms. origin_angle is metadata, not an additional rotation.
         let px = (x - self.origin_x) / self.resolution;
         let py = (y - self.origin_y) / self.resolution;
-        if !px.is_finite() || !py.is_finite() || px < 0. || py < 0.
-            || px >= self.width as f64 || py >= self.height as f64
+        if !px.is_finite()
+            || !py.is_finite()
+            || px < 0.
+            || py < 0.
+            || px >= self.width as f64
+            || py >= self.height as f64
         {
             return None;
         }
@@ -304,7 +309,9 @@ impl CleanLayer {
 
 impl std::fmt::Debug for CleanLayer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CleanLayer").field("summary", &self.summary()).finish()
+        f.debug_struct("CleanLayer")
+            .field("summary", &self.summary())
+            .finish()
     }
 }
 
@@ -555,22 +562,30 @@ fn inflate_exact(input: &[u8], limit: usize) -> Result<Vec<u8>, String> {
 }
 
 impl RoomMap {
+    pub(crate) fn room_layer(&self) -> &[u64] {
+        &self.layer
+    }
+
     pub fn display_room_outlines(&self, transform: DisplayTransform) -> Vec<DisplayRoomOutline> {
-        self.room_outlines.iter().cloned().map(|mut room| {
-            (room.label_x, room.label_y) =
-                transform.pixel(self.width, self.height, room.label_x, room.label_y);
-            for [x, y] in &mut room.outline {
-                // Polygon vertices lie on pixel edges, so reflect about the
-                // full image size; pixel-center labels use size minus one.
-                (*x, *y) = match transform {
-                    DisplayTransform::Identity => (*x, *y),
-                    DisplayTransform::Rotate180 => (self.width-*x,self.height-*y),
-                    DisplayTransform::FlipHorizontal => (self.width-*x,*y),
-                    DisplayTransform::FlipVertical => (*x,self.height-*y),
-                };
-            }
-            room
-        }).collect()
+        self.room_outlines
+            .iter()
+            .cloned()
+            .map(|mut room| {
+                (room.label_x, room.label_y) =
+                    transform.pixel(self.width, self.height, room.label_x, room.label_y);
+                for [x, y] in &mut room.outline {
+                    // Polygon vertices lie on pixel edges, so reflect about the
+                    // full image size; pixel-center labels use size minus one.
+                    (*x, *y) = match transform {
+                        DisplayTransform::Identity => (*x, *y),
+                        DisplayTransform::Rotate180 => (self.width - *x, self.height - *y),
+                        DisplayTransform::FlipHorizontal => (self.width - *x, *y),
+                        DisplayTransform::FlipVertical => (*x, self.height - *y),
+                    };
+                }
+                room
+            })
+            .collect()
     }
 
     fn calculate_room_outlines(&self) -> Vec<DisplayRoomOutline> {
@@ -609,10 +624,18 @@ impl RoomMap {
                         cells.push(neighbor);
                     }
                 };
-                if x > 0 { visit(current-1); }
-                if x+1 < width { visit(current+1); }
-                if current >= width { visit(current-width); }
-                if current+width < self.layer.len() { visit(current+width); }
+                if x > 0 {
+                    visit(current - 1);
+                }
+                if x + 1 < width {
+                    visit(current + 1);
+                }
+                if current >= width {
+                    visit(current - width);
+                }
+                if current + width < self.layer.len() {
+                    visit(current + width);
+                }
                 position += 1;
             }
             let summary = &mut components[bit];
@@ -623,69 +646,85 @@ impl RoomMap {
                 summary.largest = cells;
             }
         }
-        self.rooms.iter().filter_map(|room| {
-            let bit = room.room_id.checked_add(1).filter(|bit| *bit < 64)? as usize;
-            let summary = &components[bit];
-            let cells = &summary.largest;
-            if cells.is_empty() {
-                return None;
-            }
-            let (sum_x, sum_y) = cells.iter().fold((0_u64,0_u64), |(x,y), index|
-                (x+(index%width) as u64,y+(index/width) as u64));
-            let center_x = sum_x as f64 / cells.len() as f64;
-            let center_y = sum_y as f64 / cells.len() as f64;
-            let anchor = cells.iter().min_by(|a,b| {
-                let distance = |index: usize| ((index%width) as f64-center_x).powi(2)
-                    + ((index/width) as f64-center_y).powi(2);
-                distance(**a).total_cmp(&distance(**b)).then_with(|| a.cmp(b))
-            }).copied()?;
-            let (outline, outline_error) = match self.trace_component(cells,1_u64<<bit) {
-                Ok(outline) => (outline,None),
-                Err(error) => (Vec::new(),Some(error)),
-            };
-            Some(DisplayRoomOutline {
-                room_id: room.room_id,
-                name: room.name.as_deref().map(str::trim).filter(|name|!name.is_empty())
-                    .map(str::to_owned).unwrap_or_else(||format!("Room {}",room.room_id+1)),
-                label_x: (anchor%width) as u32,
-                label_y: (anchor/width) as u32,
-                outline,
-                components: summary.count,
-                omitted_cells: summary.total_cells-cells.len(),
-                outline_error,
+        self.rooms
+            .iter()
+            .filter_map(|room| {
+                let bit = room.room_id.checked_add(1).filter(|bit| *bit < 64)? as usize;
+                let summary = &components[bit];
+                let cells = &summary.largest;
+                if cells.is_empty() {
+                    return None;
+                }
+                let (sum_x, sum_y) = cells.iter().fold((0_u64, 0_u64), |(x, y), index| {
+                    (x + (index % width) as u64, y + (index / width) as u64)
+                });
+                let center_x = sum_x as f64 / cells.len() as f64;
+                let center_y = sum_y as f64 / cells.len() as f64;
+                let anchor = cells
+                    .iter()
+                    .min_by(|a, b| {
+                        let distance = |index: usize| {
+                            ((index % width) as f64 - center_x).powi(2)
+                                + ((index / width) as f64 - center_y).powi(2)
+                        };
+                        distance(**a)
+                            .total_cmp(&distance(**b))
+                            .then_with(|| a.cmp(b))
+                    })
+                    .copied()?;
+                let (outline, outline_error) = match self.trace_component(cells, 1_u64 << bit) {
+                    Ok(outline) => (outline, None),
+                    Err(error) => (Vec::new(), Some(error)),
+                };
+                Some(DisplayRoomOutline {
+                    room_id: room.room_id,
+                    name: room
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Room {}", room.room_id + 1)),
+                    label_x: (anchor % width) as u32,
+                    label_y: (anchor / width) as u32,
+                    outline,
+                    components: summary.count,
+                    omitted_cells: summary.total_cells - cells.len(),
+                    outline_error,
+                })
             })
-        }).collect()
+            .collect()
     }
 
-    fn trace_component(&self, cells: &[usize], mask: u64) -> Result<Vec<[u32;2]>, &'static str> {
+    fn trace_component(&self, cells: &[usize], mask: u64) -> Result<Vec<[u32; 2]>, &'static str> {
         let width = self.width as usize;
-        let mut edges = BTreeMap::<[u32;2],[u32;2]>::new();
+        let mut edges = BTreeMap::<[u32; 2], [u32; 2]>::new();
         for &index in cells {
-            let x = (index%width) as u32;
-            let y = (index/width) as u32;
+            let x = (index % width) as u32;
+            let y = (index / width) as u32;
             let mut edge = |from, to| {
                 if edges.len() >= MAX_OUTLINE_EDGES {
                     return Err("boundary_vertex_limit");
                 }
                 // Diagonal pinches have ambiguous vertices; a filled polygon
                 // could cross other regions, so use a label-only fallback.
-                if edges.insert(from,to).is_some() {
+                if edges.insert(from, to).is_some() {
                     return Err("non_simple_boundary");
                 }
                 Ok(())
             };
             // Clockwise cell edges keep the room interior on the right.
-            if y == 0 || self.layer[index-width] != mask {
-                edge([x,y],[x+1,y])?;
+            if y == 0 || self.layer[index - width] != mask {
+                edge([x, y], [x + 1, y])?;
             }
-            if x+1 == self.width || self.layer[index+1] != mask {
-                edge([x+1,y],[x+1,y+1])?;
+            if x + 1 == self.width || self.layer[index + 1] != mask {
+                edge([x + 1, y], [x + 1, y + 1])?;
             }
-            if y+1 == self.height || self.layer[index+width] != mask {
-                edge([x+1,y+1],[x,y+1])?;
+            if y + 1 == self.height || self.layer[index + width] != mask {
+                edge([x + 1, y + 1], [x, y + 1])?;
             }
-            if x == 0 || self.layer[index-1] != mask {
-                edge([x,y+1],[x,y])?;
+            if x == 0 || self.layer[index - 1] != mask {
+                edge([x, y + 1], [x, y])?;
             }
         }
         let start = *edges.keys().next().ok_or("empty_boundary")?;
@@ -706,13 +745,17 @@ impl RoomMap {
         if path.len() != edges.len() {
             return Err("holes_not_supported");
         }
-        let vertices: Vec<_> = path.iter().enumerate().filter_map(|(i,&point)| {
-            let previous = path[(i+path.len()-1)%path.len()];
-            let next = path[(i+1)%path.len()];
-            ((previous[0] != point[0] || point[0] != next[0])
-                && (previous[1] != point[1] || point[1] != next[1]))
-                .then_some(point)
-        }).collect();
+        let vertices: Vec<_> = path
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &point)| {
+                let previous = path[(i + path.len() - 1) % path.len()];
+                let next = path[(i + 1) % path.len()];
+                ((previous[0] != point[0] || point[0] != next[0])
+                    && (previous[1] != point[1] || point[1] != next[1]))
+                    .then_some(point)
+            })
+            .collect();
         if vertices.len() > MAX_OUTLINE_VERTICES {
             return Err("boundary_vertex_limit");
         }
@@ -731,7 +774,14 @@ impl RoomMap {
         pose: Option<&Value>,
         trail: impl IntoIterator<Item = &'a TrailPoint>,
     ) -> Result<Vec<u8>, String> {
-        self.png_display(pose, trail, MapDisplay { show_trail: true, ..MapDisplay::default() })
+        self.png_display(
+            pose,
+            trail,
+            MapDisplay {
+                show_trail: true,
+                ..MapDisplay::default()
+            },
+        )
     }
 
     pub(crate) fn png_display<'a>(
@@ -770,8 +820,10 @@ impl RoomMap {
         if let Some(cleaning) = cleaning.filter(|layer| layer.matches_wire_map(self))
             && let (Some(origin_x), Some(origin_y), Some(resolution)) =
                 (self.origin_x, self.origin_y, self.resolution)
-            && origin_x.is_finite() && origin_y.is_finite()
-            && resolution.is_finite() && resolution > 0.
+            && origin_x.is_finite()
+            && origin_y.is_finite()
+            && resolution.is_finite()
+            && resolution > 0.
         {
             // Sample categorically from the cleaning grid's independent
             // geometry. Each target pixel is shaded once; overlapping source
@@ -813,9 +865,11 @@ impl RoomMap {
                 let from = if sample.starts_segment {
                     pixel
                 } else {
-                    previous.filter(|(x,y): &(i32,i32)| {
-                        (pixel.0-x).abs().max((pixel.1-y).abs()) <= MAX_TRAIL_JOIN_PIXELS
-                    }).unwrap_or(pixel)
+                    previous
+                        .filter(|(x, y): &(i32, i32)| {
+                            (pixel.0 - x).abs().max((pixel.1 - y).abs()) <= MAX_TRAIL_JOIN_PIXELS
+                        })
+                        .unwrap_or(pixel)
                 };
                 self.route_line(&mut rgba, from, pixel);
                 previous = Some(pixel);
@@ -857,20 +911,24 @@ impl RoomMap {
             // the text layer; their symmetric glyphs need only transformed
             // anchors, while all world-coordinate input remains unchanged.
             if let Some(dock) = &self.dock
-                && let Some((x,y)) = self.world_pixel(dock.x,dock.y)
+                && let Some((x, y)) = self.world_pixel(dock.x, dock.y)
             {
-                let (x,y)=display.transform.pixel(self.width,self.height,x as u32,y as u32);
-                self.marker(&mut rgba,x as i32,y as i32,true);
+                let (x, y) = display
+                    .transform
+                    .pixel(self.width, self.height, x as u32, y as u32);
+                self.marker(&mut rgba, x as i32, y as i32, true);
             }
             if let Some(pose) = pose
-                && let (Some(x),Some(y)) = (
+                && let (Some(x), Some(y)) = (
                     pose.get("x").and_then(Value::as_f64),
                     pose.get("y").and_then(Value::as_f64),
                 )
-                && let Some((x,y)) = self.world_pixel(x,y)
+                && let Some((x, y)) = self.world_pixel(x, y)
             {
-                let (x,y)=display.transform.pixel(self.width,self.height,x as u32,y as u32);
-                self.marker(&mut rgba,x as i32,y as i32,false);
+                let (x, y) = display
+                    .transform
+                    .pixel(self.width, self.height, x as u32, y as u32);
+                self.marker(&mut rgba, x as i32, y as i32, false);
             }
         }
         // Unknown path schemas and unverified heading units are deliberately
@@ -890,26 +948,59 @@ impl RoomMap {
     }
 
     pub fn display_labels(&self, transform: DisplayTransform) -> Vec<DisplayLabel> {
-        self.rooms.iter().filter_map(|room| {
-            if room.room_id >= 63 {
-                return None;
-            }
-            let x = room.label_x.filter(|x| x.is_finite() && *x >= 0.0 && *x < self.width as f64)? as u32;
-            let y = room.label_y.filter(|y| y.is_finite() && *y >= 0.0 && *y < self.height as f64)? as u32;
-            if self.layer.get(y as usize * self.width as usize + x as usize) != Some(&(1u64 << (room.room_id + 1))) {
-                return None;
-            }
-            let (x,y) = transform.pixel(self.width, self.height, x, y);
-            Some(DisplayLabel {
-                room_id:room.room_id,
-                text:format!("Room {}",room.room_id+1),
-                source:"numbered_room_id",
-                x,y,
+        self.rooms
+            .iter()
+            .filter_map(|room| {
+                if room.room_id >= 63 {
+                    return None;
+                }
+                let x = room
+                    .label_x
+                    .filter(|x| x.is_finite() && *x >= 0.0 && *x < self.width as f64)?
+                    as u32;
+                let y = room
+                    .label_y
+                    .filter(|y| y.is_finite() && *y >= 0.0 && *y < self.height as f64)?
+                    as u32;
+                if self
+                    .layer
+                    .get(y as usize * self.width as usize + x as usize)
+                    != Some(&(1u64 << (room.room_id + 1)))
+                {
+                    return None;
+                }
+                let (x, y) = transform.pixel(self.width, self.height, x, y);
+                Some(DisplayLabel {
+                    room_id: room.room_id,
+                    text: room
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| format!("Room {}", room.room_id + 1)),
+                    source: if room
+                        .name
+                        .as_deref()
+                        .is_some_and(|name| !name.trim().is_empty())
+                    {
+                        "room_name"
+                    } else {
+                        "numbered_room_id"
+                    },
+                    x,
+                    y,
+                })
             })
-        }).collect()
+            .collect()
     }
 
     fn room_label(&self, rgba: &mut [u8], label: &DisplayLabel) {
+        // The native card renders the full Unicode label. Avoid corrupt partial
+        // text in this small ASCII raster font.
+        if !label.text.is_ascii() {
+            return;
+        }
         let width = label.text.len() as u32 * 4 + 3;
         let height = 9;
         if self.width < width || self.height < height {
@@ -920,28 +1011,53 @@ impl RoomMap {
         // Paint only the upright glyphs; preserve the room and cleaning pixels
         // between them instead of covering them with a rectangular label.
         for (character, byte) in label.text.bytes().enumerate() {
-            let rows = match byte {
-                b'R' => [6,5,6,5,5],
-                b'o' | b'0' => [7,5,5,5,7],
-                b'm' => [5,7,7,5,5],
-                b'1' => [2,6,2,2,7],
-                b'2' => [7,1,7,4,7],
-                b'3' => [7,1,7,1,7],
-                b'4' => [5,5,7,1,1],
-                b'5' => [7,4,7,1,7],
-                b'6' => [7,4,7,5,7],
-                b'7' => [7,1,1,1,1],
-                b'8' => [7,5,7,5,7],
-                b'9' => [7,5,7,1,7],
-                _ => [0;5],
+            let rows = match byte.to_ascii_uppercase() {
+                b'A' => [2, 5, 7, 5, 5],
+                b'B' => [6, 5, 6, 5, 6],
+                b'C' => [3, 4, 4, 4, 3],
+                b'D' => [6, 5, 5, 5, 6],
+                b'E' => [7, 4, 6, 4, 7],
+                b'F' => [7, 4, 6, 4, 4],
+                b'G' => [3, 4, 5, 5, 3],
+                b'H' => [5, 5, 7, 5, 5],
+                b'I' => [7, 2, 2, 2, 7],
+                b'J' => [1, 1, 1, 5, 2],
+                b'K' => [5, 5, 6, 5, 5],
+                b'L' => [4, 4, 4, 4, 7],
+                b'M' => [5, 7, 7, 5, 5],
+                b'N' => [5, 7, 7, 7, 5],
+                b'O' | b'0' => [7, 5, 5, 5, 7],
+                b'P' => [6, 5, 6, 4, 4],
+                b'Q' => [2, 5, 5, 3, 1],
+                b'R' => [6, 5, 6, 5, 5],
+                b'S' => [3, 4, 2, 1, 6],
+                b'T' => [7, 2, 2, 2, 2],
+                b'U' => [5, 5, 5, 5, 7],
+                b'V' => [5, 5, 5, 5, 2],
+                b'W' => [5, 5, 7, 7, 5],
+                b'X' => [5, 5, 2, 5, 5],
+                b'Y' => [5, 5, 2, 2, 2],
+                b'Z' => [7, 1, 2, 4, 7],
+                b'-' => [0, 0, 7, 0, 0],
+                b'.' => [0, 0, 0, 0, 2],
+                b'1' => [2, 6, 2, 2, 7],
+                b'2' => [7, 1, 7, 4, 7],
+                b'3' => [7, 1, 7, 1, 7],
+                b'4' => [5, 5, 7, 1, 1],
+                b'5' => [7, 4, 7, 1, 7],
+                b'6' => [7, 4, 7, 5, 7],
+                b'7' => [7, 1, 1, 1, 1],
+                b'8' => [7, 5, 7, 5, 7],
+                b'9' => [7, 5, 7, 1, 7],
+                _ => [0; 5],
             };
             for (row, bits) in rows.iter().enumerate() {
                 for column in 0..3 {
-                    if bits & (1 << (2-column)) != 0 {
-                        let x = left as usize + 2 + character*4 + column;
+                    if bits & (1 << (2 - column)) != 0 {
+                        let x = left as usize + 2 + character * 4 + column;
                         let y = top as usize + 2 + row;
-                        let index = (y*self.width as usize+x)*4;
-                        rgba[index..index+4].copy_from_slice(&[17,24,39,255]);
+                        let index = (y * self.width as usize + x) * 4;
+                        rgba[index..index + 4].copy_from_slice(&[17, 24, 39, 255]);
                     }
                 }
             }
@@ -1024,5 +1140,3 @@ impl RoomMap {
         }
     }
 }
-
-

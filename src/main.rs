@@ -1,21 +1,20 @@
 use narwal_local_service::{
     control::{CommandProfile, LocalInput},
     engine::Engine,
-    runtime::{Config, private_read},
+    runtime::{Config, PendingMapRefresh, RunMode, parse_arguments, private_read, validate_config},
     session::{self, Event},
 };
 use std::{os::unix::fs::MetadataExt, path::Path, time::Duration};
 use tokio::{net::UnixListener, sync::mpsc};
 
-#[tokio::main]
-async fn main() {
-    if let Err(error) = run().await {
+fn main() {
+    if let Err(error) = entry() {
         // Errors are fixed diagnostics, never configuration values or peer data.
         eprintln!("Narwal service: {error}");
         std::process::exit(1);
     }
 }
-async fn run() -> Result<(), String> {
+fn entry() -> Result<(), String> {
     unsafe {
         libc::umask(0o077);
     }
@@ -23,15 +22,18 @@ async fn run() -> Result<(), String> {
         return Err("run_as_dedicated_unprivileged_user".into());
     }
     let args: Vec<_> = std::env::args().collect();
-    let (config_path, initialize_only) = match args.as_slice() {
-        [_, config] => (config, false),
-        [_, flag, config] if flag == "--initialize-intent-only" => (config, true),
-        _ => return Err(
-            "usage: narwal-local-service [--initialize-intent-only] /absolute/private/config.json"
-                .into(),
-        ),
-    };
-    let config: Config = serde_json::from_slice(&private_read(Path::new(config_path))?)
+    let (config_path, mode) = parse_arguments(&args)?;
+    if mode == RunMode::ValidateConfig {
+        return validate_config(&config_path);
+    }
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "runtime_initialization_failed")?
+        .block_on(run(config_path, mode))
+}
+async fn run(config_path: std::path::PathBuf, mode: RunMode) -> Result<(), String> {
+    let config: Config = serde_json::from_slice(&private_read(&config_path)?)
         .map_err(|_| "invalid_configuration")?;
     let address = config
         .http_address
@@ -47,7 +49,7 @@ async fn run() -> Result<(), String> {
     {
         return Err("mop_settings_file_required_for_room_profile".into());
     }
-    if initialize_only {
+    if mode == RunMode::InitializeIntent {
         let path = config
             .intent_file
             .as_deref()
@@ -73,6 +75,9 @@ async fn run() -> Result<(), String> {
             .map_err(|_| "invalid_map_file")?;
         engine.load_map(&map).await?;
     }
+    if let Some(path) = config.room_editor_file {
+        engine.configure_editor(Path::new(&path)).await?;
+    }
     let e = engine.clone();
     tokio::spawn(async move {
         let mut clock = tokio::time::interval(Duration::from_secs(1));
@@ -90,6 +95,8 @@ async fn run() -> Result<(), String> {
                 async move {
                     let _ = match input {
                         LocalInput::Command(command) => e.command(command).await.map(|_| ()),
+                        LocalInput::RoomCommand { command, map_id, revision } =>
+                            e.room_command(command, map_id, revision).await.map(|_| ()),
                         LocalInput::SelectRoom(room) => {
                             e.change_mop(narwal_local_service::plan::Change::Room(room))
                                 .await
@@ -102,6 +109,9 @@ async fn run() -> Result<(), String> {
                             e.change_mop(narwal_local_service::plan::Change::Dampness(dampness))
                                 .await
                         }
+                        LocalInput::Editor(input) => e.room_editor(input).await.map(|_| ()),
+                        LocalInput::EditorName(name) => e.editor_name(name).await,
+                        LocalInput::EditorRoom(room) => e.editor_room(room).await,
                     };
                 }
             })
@@ -109,8 +119,9 @@ async fn run() -> Result<(), String> {
         });
         let state = engine.states.subscribe();
         let images = engine.images.subscribe();
+        let edit_images = engine.edit_images.subscribe();
         tokio::spawn(async move {
-            if narwal_local_service::mqtt::run(mqtt, state, images, tx)
+            if narwal_local_service::mqtt::run(mqtt, state, images, edit_images, tx)
                 .await
                 .is_err()
             {
@@ -206,11 +217,16 @@ async fn robot_listener(
             if e.refresh().await.is_ok() {
                 let _ = e.refresh_map().await;
             }
+            let mut map_refresh = PendingMapRefresh::new(std::time::Instant::now());
             let mut interval = tokio::time::interval(Duration::from_secs(10));
             interval.tick().await;
             loop {
                 interval.tick().await;
                 let _ = e.refresh().await;
+                let unresolved = e.snapshot().await["room_editor"]["unresolved_write"] == true;
+                if map_refresh.should_refresh(unresolved, std::time::Instant::now()) {
+                    let _ = e.refresh_map().await;
+                }
             }
         });
         let connection =

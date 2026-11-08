@@ -27,6 +27,8 @@ const MAP: &str = "/pita/plan_map/get";
 const POSE: &str = "/pita/map";
 const APP_ONLINE: &str = "app_net_flag";
 const COMMAND: &str = "/pita_clean_system/command";
+const MAP_SET: &str = "/pita/plan_map/set";
+const MAP_SET_PARAMS_CAP: usize = 2 * 1024 * 1024;
 const MESSAGE_CAP: usize = crate::codec::MESSAGE_CAP;
 const WRITE_DEADLINE: Duration = Duration::from_secs(5);
 const REPLY_DEADLINE: Duration = Duration::from_secs(15);
@@ -87,6 +89,11 @@ pub enum Operation {
         observation: CommandObservation,
         params: Option<Value>,
     },
+    /// A single map replacement, bound to a fresh, matched idle-status read.
+    GuardedMapSet {
+        observation: CommandObservation,
+        params: Value,
+    },
 }
 
 /// Internal metadata issued for a matched read; never accepted from robot JSON.
@@ -105,6 +112,21 @@ impl CommandObservation {
     pub(crate) fn follows(&self, before: &Self) -> bool {
         self.generation > before.generation
             || (self.generation == before.generation && self.revision > before.revision)
+    }
+
+    pub(crate) fn map_edit_idle(&self) -> bool {
+        self.state
+            == (crate::control::StatePredicate {
+                robot_status: 100,
+                work_status: 0,
+                station_contact: true,
+                error_code: 0,
+            })
+            && self
+                .mop_context
+                .as_ref()
+                .is_some_and(|context| context.idle_mop() || context.idle_vacuum())
+            && self.clean_order.as_ref().is_some_and(Vec::is_empty)
     }
 }
 
@@ -177,7 +199,6 @@ struct SessionStatus {
     diagnostics: Arc<Diagnostics>,
 }
 impl SessionStatus {
-    
     fn revoke(&mut self) {
         self.issued_revision = None;
     }
@@ -247,6 +268,10 @@ struct Pending {
 
 fn completed_command_receipt(acknowledged: bool) -> Value {
     json!({"transport_attempted":true,"transport_written":true,"acknowledged":acknowledged})
+}
+
+fn guarded_write(service: &str) -> bool {
+    matches!(service, COMMAND | MAP_SET)
 }
 
 // Tungstenite bounds WebSocket messages but not the total HTTP header bytes.
@@ -435,6 +460,26 @@ fn operation(operation: Operation) -> Result<(&'static str, Value), String> {
             }
             Ok((COMMAND, params))
         }
+        Operation::GuardedMapSet {
+            observation,
+            params,
+        } => {
+            if !observation.map_edit_idle() {
+                return Err("map_set_requires_idle_docked_robot".into());
+            }
+            // Reconstruct the captured setter fields rather than accepting an
+            // arbitrary route, operation token, or getter-only field.
+            let validated = crate::room_editor::validated_set_params(&params)?;
+            if validated != params
+                || serde_json::to_vec(&params)
+                    .map_err(|_| "map_set_encoding_failed")?
+                    .len()
+                    > MAP_SET_PARAMS_CAP
+            {
+                return Err("map_set_parameters_refused".into());
+            }
+            Ok((MAP_SET, params))
+        }
         Operation::Command { .. } | Operation::GuardedCommand { params: None, .. } => {
             Err("unguarded_motion_refused".into())
         }
@@ -504,7 +549,7 @@ async fn deliver(
     // Incoming traffic can win select! after the deadline. It must not make
     // an expired command acknowledgement eligible or extend its grace.
     if pending.as_ref().is_some_and(|waiting| {
-        waiting.service == COMMAND
+        guarded_write(waiting.service)
             && waiting.transport_written
             && Instant::now() >= waiting.deadline
     }) && let Some(expired) = pending.take()
@@ -518,7 +563,7 @@ async fn deliver(
         && service == Some(waiting.service)
     {
         let waiting = pending.take().expect("pending response");
-        if waiting.service == COMMAND {
+        if guarded_write(waiting.service) {
             let acknowledged = object.get("code").and_then(Value::as_i64) == Some(0)
                 && object.get("result").is_some_and(Value::is_object);
             let result = if waiting.transport_written {
@@ -823,8 +868,15 @@ where
                         continue;
                     }
                 }
+                if let Operation::GuardedMapSet { observation, .. } = &request.operation {
+                    if let Err(reason) = status.consume(observation, generation) {
+                        let _ = request.reply.send(Ok(before_send_refused(&reason)));
+                        continue;
+                    }
+                }
                 let command_status = matches!(request.operation, Operation::CommandStatus);
-                let guarded_motion = matches!(request.operation, Operation::GuardedCommand { .. });
+                let guarded_motion = matches!(request.operation,
+                    Operation::GuardedCommand { .. } | Operation::GuardedMapSet { .. });
                 let refused = |error: String| {
                     if guarded_motion { Ok(before_send_refused(&error)) } else { Err(error) }
                 };
@@ -854,14 +906,14 @@ where
                     .map_err(|_| "request_write_failed")?;
                 if let Some(written) = pending.as_mut() {
                     written.transport_written = true;
-                    if service == COMMAND {
+                    if guarded_write(service) {
                         written.deadline = Instant::now() + COMMAND_ACK_DEADLINE;
                     }
                 }
             }
             _ = sleep_until(reply_deadline), if pending.is_some() => {
                 if let Some(waiting) = pending.take() {
-                    if waiting.service == COMMAND && waiting.transport_written {
+                    if guarded_write(waiting.service) && waiting.transport_written {
                         // A missing optional ACK does not end the connection.
                         // The Engine can now request fresh, separate feedback.
                         let _ = waiting.reply.send(Ok(completed_command_receipt(false)));
@@ -920,7 +972,7 @@ where
     )
     .await;
     if let Some(waiting) = pending.take() {
-        let reply = if waiting.service == COMMAND && waiting.transport_written {
+        let reply = if guarded_write(waiting.service) && waiting.transport_written {
             Ok(completed_command_receipt(false))
         } else {
             Err("session_disconnected_result_unknown".into())
@@ -939,5 +991,3 @@ where
     }
     result
 }
-
-

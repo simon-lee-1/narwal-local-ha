@@ -82,7 +82,8 @@ jq --argjson uid "$service_uid" '{
   socket_path:"/run/narwal-local-ha/robot.sock",frontend_uid:$uid,
   frontend_executable:"/opt/narwal-local-ha/socat",http_address:"127.0.0.1:35394",
   profile_file:"/var/lib/narwal-local-ha/profile.json",intent_file:"/var/lib/narwal-local-ha/intent.json",
-  map_file:null,mop_settings_file:"/var/lib/narwal-local-ha/settings.json",mqtt:.mqtt,
+  map_file:null,mop_settings_file:"/var/lib/narwal-local-ha/settings.json",
+  room_editor_file:"/var/lib/narwal-local-ha/room-editor.json",mqtt:.mqtt,
   map_display:(.map_display // {transform:"identity",room_labels:true,show_trail:false})
 }' "$input" > /var/lib/narwal-local-ha/config.json
 jq '.settings' "$input" > /var/lib/narwal-local-ha/settings.json

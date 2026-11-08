@@ -83,14 +83,21 @@ with identity calibration, so no second flip or rotation belongs in the card.
 
 The Rust dashboard helper reads a private current-state snapshot and an
 operator-supplied entity/topic mapping. It emits a private JSON dashboard
-containing that installation's map ID and room geometry. These generated
-files are not distribution material.
+whose `room_source` reads current map and room data from the local catalog
+sensor. Household geometry is neither embedded in the generated configuration
+nor distributed with this repository.
 
-The unchanged Xiaomi card handles polygon selection, zoom and pass controls.
+The Xiaomi card handles polygon selection, zoom and pass controls. A narrow
+source patch adds dynamic room catalogs, current-map variables and a limit
+for split-line points. Catalog changes clear stale selections; regular HA
+updates continue to refresh the moving map and telemetry.
 Its service schema publishes nonretained `room_clean` messages through Home
 Assistant's local MQTT integration. The backend validates the explicit plan
 again against current state and does not overwrite it with saved selectors.
-Regenerate after any map, room catalog or orientation change.
+The Rooms view publishes separate draft requests and displays the backend's
+candidate image. Explicit Save sends the displayed draft identifier.
+Config Template Card supplies only these Save/Cancel action payloads; it does
+not wrap the live map. See [ROOM_EDITOR.md](ROOM_EDITOR.md).
 
 ## Upstream roles
 
@@ -99,7 +106,8 @@ Regenerate after any map, room catalog or orientation change.
 | [ha-narwal-t10](https://github.com/nitinkr0411/ha-narwal-t10) | `5ffdbc931140ac22f2d511350e5a2f7cb4a9cae5` | Legacy message framing/crypto, reply correlation, status/commands, map conventions and HA presentation |
 | [matterbridge-narwal](https://github.com/redelva/matterbridge-narwal) | `9baa889f01f94391580565af14f0116ecbba7a92` | China/J1 discovery conventions, room/map fields and cleaning-order representation |
 | [NarwalIntegration](https://github.com/sjmotew/NarwalIntegration) | `90a4e8455fd21828ab20a422439f5dcd4202509a` | Comparison with newer local WebSocket devices; its documentation excludes legacy J1/T10 |
-| [Xiaomi Vacuum Map Card](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card) | Frontend tested with v2.4.1 | Unchanged interactive room-map frontend and service-call configuration interface |
+| [Xiaomi Vacuum Map Card](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card) | `045c3ac946d4ef0a01201f306e9949643984a155` plus included patch | Interactive room map, local service requests and dynamic catalog |
+| [Config Template Card](https://github.com/custom-cards/config-template-card) | `17a4d22b76b011f45569901d98f0c5c5114d431d` (v1.3.6) | Draft-correlated Save/Cancel action buttons |
 
 These projects do not all implement the same robot protocol. In particular,
 NarwalIntegration's newer port-9002 transport is not the J1 transport.
