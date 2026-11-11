@@ -48,14 +48,13 @@ fn valid_entity(value: &str, domain: &str) -> bool {
 fn validate_entities(e: &Entities) -> Result<(), String> {
     require(
         !e.topic_prefix.is_empty()
-            && e.topic_prefix.len() <= 200
-            && !e.topic_prefix.starts_with('/')
-            && !e.topic_prefix.ends_with('/')
-            && !e.topic_prefix.contains("//")
-            && e.topic_prefix
-                .bytes()
-                .all(|c| c.is_ascii_alphanumeric() || b"/_-".contains(&c)),
-        "topic_prefix must contain only ASCII letters, digits, slash, underscore or hyphen",
+            && e.topic_prefix.len() <= 256
+            && e.topic_prefix.split('/').all(|part| !part.is_empty())
+            && !e
+                .topic_prefix
+                .chars()
+                .any(|c| c.is_control() || c == '+' || c == '#'),
+        "topic_prefix must be 1–256 UTF-8 bytes with nonempty levels and no controls or MQTT wildcards",
     )?;
     for (entity, domain) in [
         (&e.vacuum_entity, "vacuum"),
@@ -176,6 +175,76 @@ fn action(service: &str, e: &Entities) -> Value {
     json!({"action":"call-service","service":service,"service_data":{"entity_id":e.vacuum_entity}})
 }
 
+fn unicode_escapes(value: &str) -> String {
+    value
+        .encode_utf16()
+        .map(|unit| format!("\\u{unit:04x}"))
+        .collect()
+}
+
+fn command_topic(e: &Entities, suffix: &str, templated: bool) -> String {
+    let topic = format!("{}{suffix}", e.topic_prefix);
+    if !templated {
+        return topic;
+    }
+    // The card renders JSON.stringify(service_data) as Jinja in Mop mode.
+    // Emit JSON escapes through a literal so topic text cannot become a
+    // template expression or break the surrounding JSON string.
+    format!("{{{{ '{}' }}}}", unicode_escapes(&topic))
+}
+
+fn template_card_topic(e: &Entities, suffix: &str) -> String {
+    // Config Template Card evaluates strings containing ${...}. Supply a
+    // literal expression instead of allowing topic text to become JS source.
+    format!(
+        "${{\"{}\"}}",
+        unicode_escapes(&format!("{}{suffix}", e.topic_prefix))
+    )
+}
+
+fn map_unavailable_card(e: &Entities, translations: &Value) -> Value {
+    let button = |name: &str, icon: &str, service: &str| {
+        json!({"type":"button","name":name,"icon":icon,"tap_action":action(service, e),
+            "hold_action":{"action":"none"},"double_tap_action":{"action":"none"}})
+    };
+    let labels = serde_json::to_string(translations).expect("packaged error labels");
+    json!({"type":"conditional","conditions":[
+        {"condition":"state","entity":e.vacuum_entity,"state_not":"unavailable"},
+        {"condition":"or","conditions":[
+            {"condition":"state","entity":e.map_entity,"state":"unavailable"},
+            {"condition":"state","entity":e.map_entity,"state":"unknown"}
+        ]}
+    ],"card":{"type":"vertical-stack","cards":[
+        {"type":"markdown","content":"**Waiting for the map.** Job status and local controls remain available. Room selection will return when the map is ready."},
+        {"type":"entities","title":"Current job","show_header_toggle":false,"entities":[
+            {"entity":e.job_entity,"name":"Job"},
+            {"entity":e.mode_entity,"name":"Mode"},
+            {"entity":e.battery_entity,"name":"Battery"},
+            {"entity":e.progress_entity,"name":"Progress"},
+            {"entity":e.area_entity,"name":"Cleaned area"},
+            {"entity":e.dock_entity,"name":"At dock"}
+        ]},
+        {"type":"markdown","content":format!(
+            "{{% set code = states('{}') %}}{{% set labels = {} %}}**Robot status:** {{{{ labels.get(code, 'Unrecognized robot error.') }}}}",
+            e.error_entity, labels)},
+        {"type":"horizontal-stack","cards":[
+            {"type":"conditional","conditions":[{"condition":"or","conditions":[
+                {"condition":"state","entity":e.mode_entity,"state":"Mop"},
+                {"condition":"state","entity":e.mode_entity,"state":"Vacuum"}
+            ]}],"card":button("Return to dock","mdi:home-import-outline","vacuum.return_to_base")},
+            {"type":"conditional","conditions":[
+                {"condition":"state","entity":e.mode_entity,"state":"Mop"},
+                {"condition":"state","entity":e.vacuum_entity,"state":"cleaning"}
+            ],"card":button("Pause","mdi:pause","vacuum.pause")},
+            {"type":"conditional","conditions":[
+                {"condition":"state","entity":e.mode_entity,"state":"Mop"},
+                {"condition":"state","entity":e.vacuum_entity,"state":"paused"},
+                {"condition":"state","entity":e.error_entity,"state":"0"}
+            ],"card":button("Resume current task","mdi:play-pause","vacuum.start")}
+        ]}
+    ]}})
+}
+
 fn map_card(mode: &str, e: &Entities, translations: &Value) -> Value {
     let mop = mode == "Mop";
     let handler = format!(
@@ -239,8 +308,11 @@ fn map_card(mode: &str, e: &Entities, translations: &Value) -> Value {
             "icon":"mdi:floor-plan","selection_type":"ROOM","id_type":"number",
             "max_selections":32,"repeats_type":"EXTERNAL",
             "max_repeats":3,"run_immediately":false,
+            // Whole-value variable lookup prevents topic text containing
+            // [[selection]] or another card token from being substituted.
+            "variables":{"narwal_command_topic":command_topic(e, "/command/room_clean", mop)},
             "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":mop,
-                "service_data":{"topic":format!("{}/command/room_clean",e.topic_prefix),
+                "service_data":{"topic":"[[narwal_command_topic]]",
                     "retain":false,"qos":0,"payload":payload}},
             "predefined_selections":[]
         }]
@@ -284,8 +356,9 @@ fn editor_view(e: &Entities) -> Value {
             "name":name,"icon":icon,"selection_type":selection,"id_type":"number",
             "max_selections":count,"repeats_type":"NONE","run_immediately":false,
             "coordinates_rounding":false,
+            "variables":{"narwal_command_topic":command_topic(e, "/room_editor/draft", false)},
             "service_call_schema":{"service":"mqtt.publish","evaluate_data_as_template":false,
-                "service_data":{"topic":format!("{}/room_editor/draft",e.topic_prefix),
+                "service_data":{"topic":"[[narwal_command_topic]]",
                     "qos":0,"retain":false,"payload":payload}}
         });
         if selection == "ROOM" {
@@ -311,7 +384,7 @@ fn editor_view(e: &Entities) -> Value {
         json!({"type":"button","name":if save {"Save"} else {"Cancel draft"},
             "icon":if save {"mdi:content-save"} else {"mdi:cancel"},
             "tap_action":{"action":action,"service":"mqtt.publish","service_data":{
-                "topic":format!("{}/room_editor/{operation}",e.topic_prefix),
+                "topic":template_card_topic(e, &format!("/room_editor/{operation}")),
                 "qos":0,"retain":false,
                 "payload":format!("${{JSON.stringify({{draft_id: {draft}?.draft_id ?? ''}})}}")
             }},
@@ -400,20 +473,19 @@ fn generate(state: &Value, e: &Entities) -> Result<Value, String> {
             {"condition":"state","entity":e.error_entity,"state_not":"unknown"},
             {"condition":"state","entity":e.error_entity,"state_not":"unavailable"}
         ],"card":{"type":"markdown","title":"Robot needs attention","content":error_text}}),
-        json!({"type":"conditional","conditions":[{"condition":"or","conditions":[
-            {"condition":"state","entity":e.vacuum_entity,"state":"unavailable"},
-            {"condition":"state","entity":e.vacuum_entity,"state":"unknown"}
-        ]}],"card":{"type":"markdown","content":"**J1 is offline.** Waiting for the local connection. Live position and controls will return when the robot reconnects."}}),
+        json!({"type":"conditional","conditions":[
+            {"condition":"state","entity":e.vacuum_entity,"state":"unavailable"}
+        ],"card":{"type":"markdown","content":"**J1 is offline.** Waiting for the local connection. Live position and controls will return when the robot reconnects."}}),
     ];
     for mode in ["Vacuum", "Mop"] {
         cards.push(json!({"type":"conditional","conditions":[
             {"condition":"state","entity":e.mode_entity,"state":mode},
             {"condition":"state","entity":e.vacuum_entity,"state_not":"unavailable"},
-            {"condition":"state","entity":e.vacuum_entity,"state_not":"unknown"},
             {"condition":"state","entity":e.map_entity,"state_not":"unavailable"},
             {"condition":"state","entity":e.map_entity,"state_not":"unknown"}
         ],"card":map_card(mode, e, &translations)}));
     }
+    cards.push(map_unavailable_card(e, &translations));
     cards.push(json!({"type":"markdown","content":
         "**Tap a room area to select it; tap it again to remove it.** Check the highlighted rooms, then press ▶ to clean all selected rooms. **Clear room selection** removes every selection.\n\n\
          **Robot:** red circle · **Dock:** white square. Darker areas show robot-reported cleaning passes. Progress and area may reset or retain the previous job after docking."}));

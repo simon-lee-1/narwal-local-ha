@@ -21,7 +21,7 @@ input_parent=$(dirname -- "$input")
 [[ -f $binary && ! -L $binary && -x $binary ]] || fail 'release binary is missing'
 jq -e '
   def ipv4: type == "string" and
-    test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$") and
+    test("\\A(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}\\z") and
     (split(".") | all(.[]; (tonumber >= 0 and tonumber <= 255))) and
     (split(".")[0] | tonumber | . > 0 and . < 224);
   (del(.map_display)|keys|sort) == ["bind_ipv4","mqtt","robot_ipv4","settings"] and
@@ -32,13 +32,16 @@ jq -e '
     (.map_display.room_labels|type=="boolean") and
     (.map_display.show_trail|type=="boolean")
    else true end) and
-  (.bind_ipv4|ipv4) and (.robot_ipv4|ipv4) and (.mqtt.host|ipv4) and
+  (.bind_ipv4|ipv4) and (.robot_ipv4|ipv4) and
+  (.mqtt|type=="object") and
+  (.mqtt|keys|sort)==["client_id","host","password","port","topic_prefix","username"] and
+  (.mqtt.host|ipv4) and
   (.mqtt.port|type=="number" and .>=1 and .<=65535 and floor==.) and
-  (.mqtt.username|type=="string" and length>0 and length<=256 and (startswith("REPLACE_")|not)) and
-  (.mqtt.password|type=="string" and length>0 and length<=8192 and (startswith("REPLACE_")|not)) and
-  (.mqtt.client_id|test("^[A-Za-z0-9_-]{1,64}$")) and
-  (.mqtt.topic_prefix|type=="string" and length>0 and length<=256 and
-    (test("[+#[:cntrl:][:space:]]")|not) and (split("/")|all(.[];length>0))) and
+  (.mqtt.username|type=="string" and utf8bytelength>0 and utf8bytelength<=256 and (startswith("REPLACE_")|not)) and
+  (.mqtt.password|type=="string" and utf8bytelength>0 and utf8bytelength<=8192 and (startswith("REPLACE_")|not)) and
+  (.mqtt.client_id|type=="string" and test("\\A[A-Za-z0-9_-]{1,64}\\z")) and
+  (.mqtt.topic_prefix|type=="string" and utf8bytelength>0 and utf8bytelength<=256 and
+    (test("[+#[:cntrl:]]")|not) and (split("/")|all(.[];length>0))) and
   (.settings|keys|sort) == ["rooms","selected","version"] and
   .settings.version == 1 and (.settings.rooms|length>=1 and length<=32) and
   (.settings.rooms|all(.[]; (keys|sort)==["id","name"] and

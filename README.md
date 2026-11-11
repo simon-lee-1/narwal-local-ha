@@ -47,7 +47,10 @@ cargo build --locked --release
 
 The runtime is `target/release/narwal-local-service`. It requires
 `libcrypto.so.3`; build for a compatible libc/OpenSSL environment.
-The source uses Rust edition 2024 and the dependency versions in `Cargo.lock`.
+Build with Rust 1.88 or newer. The source uses Rust edition 2024, including
+let chains, and the dependency versions in `Cargo.lock`.
+MQTT uses plain TCP on the trusted local network; its unused TLS dependency
+features are disabled. The robot-facing TLS connection is handled by socat.
 
 Follow the [deployment guide](deploy/README.md), then
 [generate your dashboard](deploy/dashboard/README.md) from your own current

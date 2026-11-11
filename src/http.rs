@@ -246,7 +246,7 @@ const PAGE: &str = r##"<!doctype html>
 <div id="map-empty" class="empty"><div class="empty-mark" aria-hidden="true">⌗</div><p>No room map received yet.</p><p class="muted">A map will appear after the J1 supplies it.</p></div>
 <div id="map-stage" class="map-stage" hidden><img id="map-image" alt="Reported Narwal J1 room map"><svg id="map-labels" aria-hidden="true"></svg></div></div>
 <aside class="rooms"><h3>Reported rooms</h3><p class="muted">Names and IDs from your map</p><div id="room-list" class="room-list"></div><p id="room-selection" class="room-selection">No rooms received.</p></aside></div>
-<div class="controls"><div class="actions"><button class="primary" id="start" disabled>Start cleaning</button><button id="pause" disabled>Pause</button><button id="stop" disabled>Stop</button><button id="return_to_base" disabled>Return to dock</button></div>
+<div class="controls"><div class="actions"><button class="primary" id="start" disabled>Start cleaning</button><button id="pause" disabled>Pause</button><button id="return_to_base" disabled>Return to dock</button></div>
 <p id="controls-note" class="muted controls-note">Controls unavailable until verified for this J1.</p></div>
 </section>
 <p id="message" class="message" role="status" aria-live="polite"></p>
@@ -256,7 +256,7 @@ const PAGE: &str = r##"<!doctype html>
 "use strict";
 const token="__TOKEN__", $=id=>document.getElementById(id);
 let current=null,busy=false,loading=false,selected=new Set(),lastImageKey="";
-const commands=["start","pause","stop","return_to_base"];
+const commands=["start","pause","return_to_base"];
 const labelRoom=r=>typeof r.name==="string"&&r.name.trim()?r.name:"Room "+r.room_id;
 function message(text,error=false){$("message").textContent=text;$("message").classList.toggle("error",error);}
 function shown(value){return value===undefined||value===null?"—":String(value);}
@@ -272,17 +272,21 @@ function render(s){
  for(const command of commands)$(command).disabled=busy||!online||!enabled.has(command);
  $("return_to_base").disabled=$("return_to_base").disabled||status.station_contact!==false;
  $("refresh").disabled=busy||!s.connected;$("read-map").disabled=busy||!s.connected;
- $("controls-note").textContent=!s.commands_enabled?"Controls unavailable until verified for this J1.":!online?"Fresh robot feedback is required before sending a command.":"Commands are checked against the robot’s reported response.";
+ const paused=status.clean_mode===3&&status.robot_status===303&&status.work_status===0&&status.station_contact===false;
+ $("start").textContent=paused?"Resume cleaning":"Start cleaning";
+ $("controls-note").textContent=!s.commands_enabled?"Controls unavailable until verified for this J1.":!online?"Fresh robot feedback is required before sending a command.":paused?"Resume continues the existing paused task. Saved settings apply to a new job.":s.mop_settings?"Start uses the saved room plan shown here. Change the saved settings in Home Assistant.":"Commands are checked against the robot’s reported response.";
  const map=s.map,rooms=map&&Array.isArray(map.rooms)?map.rooms:[],canSelect=online&&enabled.has("start")&&s.room_selection_enabled===true&&!busy;
  const actual=new Set(rooms.map(r=>r.room_id));for(const id of selected)if(!actual.has(id))selected.delete(id);
  if(!canSelect)selected.clear();
  $("room-list").replaceChildren();
  for(const room of rooms){
-  const label=document.createElement("label");label.className="room";
-  const box=document.createElement("input");box.type="checkbox";box.value=String(room.room_id);box.checked=selected.has(room.room_id);box.disabled=!canSelect;
-  box.addEventListener("change",()=>{if(box.checked)selected.add(room.room_id);else selected.delete(room.room_id);selection(rooms,canSelect);});
+  const label=document.createElement(s.room_selection_enabled===true?"label":"div");label.className="room";
+  if(s.room_selection_enabled===true){
+   const box=document.createElement("input");box.type="checkbox";box.value=String(room.room_id);box.checked=selected.has(room.room_id);box.disabled=!canSelect;
+   box.addEventListener("change",()=>{if(box.checked)selected.add(room.room_id);else selected.delete(room.room_id);selection(rooms,canSelect);});label.appendChild(box);
+  }
   const title=document.createElement("span");title.className="room-title";title.textContent=labelRoom(room);
-  const id=document.createElement("div");id.className="room-id";id.textContent="ID "+room.room_id;title.appendChild(id);label.append(box,title);$("room-list").appendChild(label);
+  const id=document.createElement("div");id.className="room-id";id.textContent="ID "+room.room_id;title.appendChild(id);label.appendChild(title);$("room-list").appendChild(label);
  }
  selection(rooms,canSelect);
  $("map-stage").hidden=!map;$("map-empty").hidden=!!map;
@@ -297,7 +301,15 @@ function render(s){
  }else{$("map-caption").textContent=s.map_error?"Map unavailable: "+s.map_error:"Waiting for a reported map";}
  const last=s.last_command;$("last-command").textContent=last?"Last command: "+last.command+" · "+(last.verified?"expected state observed":last.outcome||"awaiting feedback"):"";
 }
-function selection(rooms,allowed){$("room-selection").textContent=!rooms.length?"No rooms received.":!allowed?"Room selection is unavailable until verified and online.":selected.size?selected.size+" room"+(selected.size===1?"":"s")+" selected":"No selection: clean the configured full area.";}
+function selection(rooms,allowed){
+ const settings=current&&current.mop_settings,plan=settings&&settings.selected;
+ if(plan&&Array.isArray(settings.rooms)&&Array.isArray(plan.rooms)){
+  const names=plan.rooms.map(id=>{const room=settings.rooms.find(room=>room.id===id);return room?room.name:"Room "+id;});
+  const dampness=current.status&&current.status.clean_mode===3?" · "+plan.dampness:"";
+  $("room-selection").textContent="Saved plan: "+names.join(", ")+" · "+plan.passes+" pass"+(plan.passes===1?"":"es")+dampness;return;
+ }
+ $("room-selection").textContent=!rooms.length?"No rooms received.":current&&current.room_selection_enabled!==true?"Saved room settings are unavailable.":!allowed?"Room selection is unavailable until verified and online.":selected.size?selected.size+" room"+(selected.size===1?"":"s")+" selected":"No selection: clean the configured full area.";
+}
 async function load(){if(loading)return;loading=true;try{const response=await fetch("/api/state",{cache:"no-store",signal:AbortSignal.timeout(5000)});if(!response.ok)throw new Error("Cannot read local service");render(await response.json());}catch(error){$("online").textContent="Service unavailable";$("online").classList.remove("online");for(const command of commands)$(command).disabled=true;$("refresh").disabled=true;$("read-map").disabled=true;message(error.message,true);}finally{loading=false;}}
 async function send(path,body){
  if(busy)return;busy=true;if(current)render(current);message("Waiting for the robot…");

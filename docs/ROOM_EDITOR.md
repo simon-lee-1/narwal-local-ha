@@ -21,11 +21,28 @@ store when needed; preserve that store across upgrades. It contains private
 names, draft data and map-edit state. Keep it out of the checkout and do not
 delete it to clear an unresolved operation.
 
+On the first accepted map, existing configured room labels fill blank native
+names for matching room IDs. Saved aliases take precedence; inference leaves
+nonempty native names unchanged. Inferred labels are trimmed and skipped if
+they would duplicate another room's name. Migrated labels become local aliases
+and keep precedence over later native name updates for the same map and room.
+With an editor store, these aliases are persisted; otherwise they are held for
+the current map session. Older settings without an editor store contain
+no historical map identity, so their initial room IDs must describe the current
+map. Later map IDs do not inherit those labels, and removed-room aliases are
+discarded rather than restored if an ID reappears.
+
 Restart the bridge with the reviewed configuration, then check its editor,
 catalog, text, split-room selector and preview-image MQTT entities. Without
 editor configuration or a local connection, the Rooms view reports that the
 editor is unavailable and does not enable Save. The committed catalog
 continues to serve the cleaning view.
+
+With the editor enabled, a readable map that fails editor validation can remain
+available as a diagnostic image. It is not advertised as the current map:
+room selection, old robot positions and cleaning history are invalidated until
+a valid map is accepted.
+A failed validation or persistence step cannot qualify a map Save.
 
 ## Prepare and save
 

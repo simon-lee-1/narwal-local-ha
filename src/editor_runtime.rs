@@ -273,6 +273,9 @@ pub(super) struct EditorState {
     store: Option<Store>,
     draft: Option<Draft>,
     pub(super) catalog: Value,
+    accepted_map_id: Option<String>,
+    accepted_aliases: BTreeMap<u64, String>,
+    accepted_names: BTreeMap<u64, String>,
     name: String,
     room: Option<u64>,
     message: Option<String>,
@@ -297,27 +300,26 @@ fn digest_value(value: &Value) -> String {
 }
 impl EditorState {
     fn aliases(&self, raw: &Value) -> BTreeMap<u64, String> {
-        self.store
-            .as_ref()
-            .filter(|store| store.saved.map_id == map_id(raw).ok())
-            .map(|store| {
-                store
-                    .saved
-                    .aliases
-                    .iter()
-                    .filter(|(id, _)| {
-                        raw.pointer("/room_attr/attr")
-                            .and_then(Value::as_array)
-                            .is_some_and(|attrs| {
-                                attrs
-                                    .iter()
-                                    .any(|attr| attr["room_id"].as_u64() == Some(**id))
-                            })
-                    })
-                    .map(|(id, name)| (*id, name.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
+        let id = map_id(raw).ok();
+        let mut aliases = if self.accepted_map_id == id {
+            self.accepted_aliases.clone()
+        } else {
+            BTreeMap::new()
+        };
+        if let Some(store) = self.store.as_ref().filter(|store| store.saved.map_id == id) {
+            // A saved rename overrides an earlier accepted display name.
+            aliases.extend(store.saved.aliases.clone());
+        }
+        aliases.retain(|id, _| {
+            raw.pointer("/room_attr/attr")
+                .and_then(Value::as_array)
+                .is_some_and(|attrs| {
+                    attrs
+                        .iter()
+                        .any(|attr| attr["room_id"].as_u64() == Some(*id))
+                })
+        });
+        aliases
     }
     pub(super) fn motion_ready(&self) -> bool {
         self.store.as_ref().is_none_or(|store| {
@@ -331,6 +333,79 @@ impl EditorState {
     }
 }
 impl Inner {
+    fn aliases_for_map(&self, raw: &Value) -> BTreeMap<u64, String> {
+        let mut aliases = self.editor.aliases(raw);
+        let Ok(id) = map_id(raw) else {
+            return aliases;
+        };
+        let names = if self.editor.accepted_map_id.as_ref() == Some(&id) {
+            self.editor.accepted_names.clone()
+        } else if self.editor.accepted_map_id.is_none()
+            && self.editor.store.as_ref().is_none_or(|store| {
+                store.saved.pending.is_none()
+                    && store.saved.map_id.as_ref().is_none_or(|saved| saved == &id)
+            })
+        {
+            // Legacy settings have no map identity. Bind their labels only to
+            // the first accepted map, never to a later diagnostic/rejected map.
+            self.mop_settings
+                .as_ref()
+                .map(|store| {
+                    store
+                        .settings()
+                        .rooms
+                        .iter()
+                        .map(|room| (room.id, room.name.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            BTreeMap::new()
+        };
+        if let Some(attrs) = raw.pointer("/room_attr/attr").and_then(Value::as_array) {
+            for attr in attrs {
+                let Some(room) = attr["room_id"].as_u64().filter(|id| *id <= 62) else {
+                    continue;
+                };
+                if aliases.contains_key(&room)
+                    || attr["name"]
+                        .as_str()
+                        .is_some_and(|name| !name.trim().is_empty())
+                {
+                    continue;
+                }
+                let Some(name) = names.get(&room).map(|name| name.trim()) else {
+                    continue;
+                };
+                // Inferred legacy labels must not make a valid native catalog
+                // ambiguous. Explicit saved aliases remain strictly validated.
+                let conflict = attrs.iter().any(|other| {
+                    let Some(other_id) = other["room_id"]
+                        .as_u64()
+                        .filter(|id| *id <= 62 && *id != room)
+                    else {
+                        return false;
+                    };
+                    let other_name = aliases
+                        .get(&other_id)
+                        .cloned()
+                        .or_else(|| {
+                            other["name"]
+                                .as_str()
+                                .map(str::trim)
+                                .filter(|name| !name.is_empty())
+                                .map(str::to_owned)
+                        })
+                        .unwrap_or_else(|| format!("Room {}", other_id + 1));
+                    other_name == name
+                });
+                if !name.is_empty() && !conflict {
+                    aliases.insert(room, name.to_owned());
+                }
+            }
+        }
+        aliases
+    }
     pub(super) fn check_room_binding(
         &self,
         binding: Option<&(String, String)>,
@@ -405,21 +480,30 @@ impl Inner {
         fresh_reply: bool,
         verification_id: Option<&str>,
     ) -> Result<(), String> {
-        self.map = Some(crate::maps::parse(&raw)?);
-        self.raw_map = Some(raw.clone());
-        self.editor.catalog_ready = false;
-        self.editor.geometry_ready = false;
-        let result = self.refresh_editor_catalog(raw, fresh_reply, verification_id);
+        let readable = crate::maps::parse(&raw)?;
+        let result = self.refresh_editor_catalog(raw.clone(), fresh_reply, verification_id);
+        // Every replacement path, including direct editor refresh/readback,
+        // invalidates positions and cleaning history from the previous map.
+        self.clear_pose();
+        self.clear_cleaning_history();
         if let Err(error) = &result {
+            self.map = Some(readable);
+            self.raw_map = Some(raw);
+            self.editor.catalog_ready = false;
+            self.editor.geometry_ready = false;
             self.editor.catalog = Value::Null;
             self.editor.message = Some(error.clone());
+            if self.editor.store.is_some() {
+                // Retain a readable diagnostic image without qualifying it as
+                // the current map or letting a failed Save appear successful.
+                self.map_generation = None;
+                self.map_error = Some(error.clone());
+                return result;
+            }
         }
         // The editor's stricter schema does not remove an otherwise readable map.
-        if self.editor.store.is_some() {
-            result
-        } else {
-            Ok(())
-        }
+        self.map_error = None;
+        Ok(())
     }
     fn refresh_editor_catalog(
         &mut self,
@@ -432,7 +516,6 @@ impl Inner {
             .len()
             > MAX_MAP_BYTES
         {
-            self.editor.catalog_ready = false;
             return Err("editor_map_too_large".into());
         }
         // An uncertain write is reconciled by observation only, never replayed.
@@ -441,42 +524,31 @@ impl Inner {
             .store
             .as_ref()
             .and_then(|store| store.saved.pending.clone());
-        if fresh_reply
+        let reconciled = if fresh_reply
             && let Some(pending) = pending
             && (!pending.require_ack
                 || (pending.acknowledged && verification_id == Some(pending.draft_id.as_str())))
             && crate::room_editor::map_write_matches(&pending.candidate, &raw)?
         {
-            let store = self
-                .editor
-                .store
-                .as_mut()
-                .ok_or("editor_store_unavailable")?;
-            store.replace(Saved {
+            Some(Saved {
                 version: 1,
                 map_id: Some(pending.map_id),
                 aliases: pending.aliases,
                 pending: None,
                 last_backup: Some(pending.before),
-            })?;
-            self.editor.draft = None;
-            self.editor.confirmed = true;
-            self.editor.message = None;
-        }
-        let aliases = self.editor.aliases(&raw);
-        if fresh_reply
-            && let Some(store) = self.editor.store.as_mut()
-            && store.saved.pending.is_none()
-            && store.saved.map_id == map_id(&raw).ok()
-            && aliases != store.saved.aliases
-        {
-            let mut next = store.saved.clone();
-            next.aliases = aliases.clone();
-            store.replace(next)?;
-        }
+            })
+        } else {
+            None
+        };
+        let aliases = reconciled
+            .as_ref()
+            .map(|saved| saved.aliases.clone())
+            .unwrap_or_else(|| self.aliases_for_map(&raw));
+        let id = map_id(&raw)?;
         let draft = RoomDraft::new(raw.clone(), aliases)?;
         let preview = draft.preview(self.map_display.transform)?;
-        self.editor.geometry_ready = preview.geometry_available
+        let rendered = crate::maps::parse(&draft.preview_raw())?;
+        let geometry_ready = preview.geometry_available
             && selectable_rooms(&preview)
             && crate::room_editor::validated_set_params(&raw).is_ok();
         let rooms: Vec<_> = preview
@@ -494,16 +566,8 @@ impl Inner {
         let revision = digest_value(&json!({
             "map":draft.revision(),"aliases":draft.aliases(),"transform":self.map_display.transform
         }));
-        self.editor.catalog = json!({"map_id":map_id(&raw)?,"revision":revision,
+        let catalog = json!({"map_id":id,"revision":revision,
             "coordinate_space":"display_pixels","rooms":rooms});
-        self.editor.catalog_ready = true;
-        if !preview
-            .rooms
-            .iter()
-            .any(|room| Some(room.id) == self.editor.room)
-        {
-            self.editor.room = preview.rooms.first().map(|room| room.id);
-        }
         if let Some(store) = &mut self.mop_settings {
             store.replace_catalog(
                 preview
@@ -516,7 +580,46 @@ impl Inner {
                     .collect(),
             )?;
         }
-        self.map = Some(crate::maps::parse(&draft.preview_raw())?);
+        // Validate/render and persist dependent settings before clearing any
+        // durable pending write. On IO failure the caller keeps the map unqualified.
+        if let Some(next) = reconciled {
+            self.editor
+                .store
+                .as_mut()
+                .ok_or("editor_store_unavailable")?
+                .replace(next)?;
+            self.editor.draft = None;
+            self.editor.confirmed = true;
+            self.editor.message = None;
+        } else if fresh_reply
+            && let Some(store) = self.editor.store.as_mut()
+            && store.saved.pending.is_none()
+            && store.saved.map_id.as_ref().is_none_or(|saved| saved == &id)
+            && (store.saved.map_id.as_ref() != Some(&id) || draft.aliases() != &store.saved.aliases)
+        {
+            let mut next = store.saved.clone();
+            next.map_id = Some(id.clone());
+            next.aliases = draft.aliases().clone();
+            store.replace(next)?;
+        }
+        self.editor.accepted_map_id = Some(id);
+        self.editor.accepted_aliases = draft.aliases().clone();
+        self.editor.accepted_names = preview
+            .rooms
+            .iter()
+            .map(|room| (room.id, room.name.clone()))
+            .collect();
+        self.editor.geometry_ready = geometry_ready;
+        self.editor.catalog = catalog;
+        self.editor.catalog_ready = true;
+        if !preview
+            .rooms
+            .iter()
+            .any(|room| Some(room.id) == self.editor.room)
+        {
+            self.editor.room = preview.rooms.first().map(|room| room.id);
+        }
+        self.map = Some(rendered);
         self.raw_map = Some(raw);
         Ok(())
     }

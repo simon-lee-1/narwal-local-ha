@@ -51,29 +51,36 @@ With the configured prefix represented by `<prefix>`:
 | Topic | Input or output |
 |---|---|
 | `<prefix>/command` | Non-retained `start`, `pause`, `return_to_base`, when supported |
-| `<prefix>/command/room_clean` | Current map ID and explicit room/pass/dampness plan |
+| `<prefix>/command/room_clean` | Current map ID/revision and explicit room/pass/dampness plan |
 | `<prefix>/room/set` | Exact configured room label |
 | `<prefix>/passes/set` | 1–3 in Mop and Vacuum modes |
 | `<prefix>/dampness/set` | Exact `Normal` or `Wet`, applicable to Mop |
 | `<prefix>/state` | Retained observed state, job status, tracking, settings and command diagnostics |
 | `<prefix>/availability` | Retained availability and offline last will |
+| `<prefix>/map/availability` | Retained availability of the accepted current map |
 | `<prefix>/map/image` | Retained local map PNG for the image and camera entities |
 
-`room_clean` accepts a JSON object with exactly `map_id`, `rooms`, `passes`
-and `dampness`. The map ID must match the current map. Rooms must be 1–32
+`room_clean` accepts a JSON object with exactly `map_id`, `revision`, `rooms`,
+`passes` and `dampness`. The map ID and revision must match the current room
+catalog. Rooms must be 1–32
 unique numeric IDs from the configured catalog. Passes must fit the current
 mode, and dampness must be Normal or Wet even though the Vacuum wire command
 omits it. The payload is limited to 2048 bytes. Use QoS 0 and `retain: false`.
-Unknown/duplicate fields, malformed values, retained messages and duplicate
-MQTT deliveries are rejected.
+Unknown/duplicate fields, malformed values, retained messages and deliveries
+with MQTT's duplicate flag are rejected.
+Distinct repeated button clicks do not necessarily carry that flag.
 
 Room editing uses separate `room_editor` topics and a draft/Save workflow.
 It never reuses the cleaning command topic. See [ROOM_EDITOR.md](ROOM_EDITOR.md).
 
 Explicit map requests freeze their own plan without changing saved selectors.
-Ordinary `vacuum.start` uses the saved plan for a new task, or resumes the
-existing paused Mop task without replacing its rooms. Changing a setting
-persists it without motion.
+Ordinary `vacuum.start` reads the saved plan when the engine executes the
+request in order, so an earlier accepted setting change applies to that Start.
+It resumes an existing paused Mop task without replacing its rooms.
+Changing a setting persists it without motion.
+The loopback page shows the saved room names and settings without an alternate
+room checklist when persistent settings are configured. Its Start button
+becomes Resume cleaning for a paused Mop task.
 
 The engine owns serial delivery and writes durable intent before motion.
 Uncertain sends remain unresolved across restart. Reconnection republishes
@@ -90,7 +97,15 @@ for a later dock cycle.
 ## Status and map
 
 Availability requires a connected session and status no more than 30 seconds
-old. Job labels distinguish supported preparation, mop washing, mopping,
+old. Current-map availability additionally requires an accepted map from the
+current connection. Home Assistant may show the image as `unknown` before its
+first accepted image, or `unavailable` when current-map availability is offline;
+neither condition suppresses independently fresh robot telemetry or supported
+Return/Pause/Resume controls in the dashboard.
+Unchanged retained robot/editor state is published on a 60-second heartbeat.
+Changed state, availability and marker expiry are published promptly; this
+suppresses redundant outgoing state, not repeated command requests.
+Job labels distinguish supported preparation, mop washing, mopping,
 vacuuming, returning, leaving dock, paused and idle states. Faults take
 precedence. An unqualified active dock phase is **Dock cycle**, not an inferred
 Drying phase. Dock contact remains separate from paused or retained tasks.

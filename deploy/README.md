@@ -2,7 +2,8 @@
 
 Use a dedicated service host with systemd and a stable IPv4 address reachable
 from the robot. Installation needs root; the running processes use a dedicated
-unprivileged account. Build the release with `cargo build --locked --release`.
+unprivileged account. Build with Rust 1.88 or newer using
+`cargo build --locked --release`.
 On Debian/Ubuntu, runtime installation tools include `socat`, `openssl`,
 `jq`, `iproute2`, and the package providing `libcrypto.so.3`
 (`libssl3` or `libssl3t64`, depending on the distribution).
@@ -29,9 +30,9 @@ cp deploy/install.example.json ~/narwal-private/install.json
 
 Set `bind_ipv4` to the bridge's **robot-facing address**, `robot_ipv4` to the
 robot's reserved address and `mqtt.host` to the broker's IPv4 address. The
-installer accepts IPv4 addresses rather than hostnames so the service firewall
-can allow only those peers. The robot must actually be using a DNS resolver
-you control.
+installer requires canonical dotted-decimal IPv4 addresses, without leading
+zeroes, so the service firewall can allow only those peers.
+The robot must actually be using a DNS resolver you control.
 
 Replace the example room catalog with IDs verified from your robot's room map
 and app. Record app room names and map references before redirecting its
@@ -53,6 +54,11 @@ before the first Start.
 Keep `topic_prefix` and `client_id` unique per robot. Changing a client ID later
 creates new HA discovery identities. Never share a MQTT identity with a public
 broker or expose the HTTP API to another network.
+The prefix accepts 1–256 UTF-8 bytes with nonempty slash-separated levels;
+spaces, dots and Unicode are literal data, while control characters and MQTT
+wildcards (`+`, `#`) are refused. Credentials are bounded by UTF-8 bytes:
+username up to 256 and password up to 8192. The `mqtt` object accepts exactly
+the six keys shown in the example; options such as `tls` are unsupported.
 
 ## Install without starting
 
@@ -76,6 +82,7 @@ It installs the executable and a canonical root-owned copy of socat in
 | `/var/lib/narwal-local-ha/intent.json` | Durable command journal; initialized once |
 | `/var/lib/narwal-local-ha/room-editor.json` | Private room aliases, draft and map-edit state |
 | `/var/lib/narwal-local-ha/key.pem` | Host-local generated TLS private key |
+| `/var/lib/narwal-local-ha/certificate.pem` | Host-local generated TLS certificate |
 | `/etc/narwal-local-ha/frontend.env` | Source-filtered TLS listener configuration |
 
 Private files are mode 0600 in canonical mode-0700 directories. UID and GID are
@@ -109,7 +116,7 @@ The app is not assumed to remain connected alongside the local bridge.
    redirection or credential-capture helper.
 4. Read the loopback API: `curl --fail http://127.0.0.1:35394/api/state`.
    Verify a connected session, fresh status, the expected mode, no error and
-   actual dock contact. Access remotely through an SSH local forward.
+   actual dock contact. Access remotely through an SSH local forward as below.
 5. Check the MQTT-discovered Narwal device in Home Assistant. Verify telemetry,
    Job status and native map-image delivery before the first supervised room
    command. Check whether the robot marker is reported or inferred from dock
@@ -118,6 +125,18 @@ The app is not assumed to remain connected alongside the local bridge.
    Return once and verify docking. See [control behavior](../docs/CONTROL.md).
 6. After acceptance, enable startup with
    `sudo systemctl enable narwal-local-ha.service`.
+
+For remote access, substitute your bridge's SSH destination:
+
+```sh
+ssh -N -L 127.0.0.1:35394:127.0.0.1:35394 user@bridge-host
+```
+
+Open exactly `http://127.0.0.1:35394/` in the local browser. The HTTP guard
+requires that host and port; `localhost`, a different forwarded port or a
+proxy-rewritten Host/Origin is refused. The loopback page displays saved room
+names, passes and mop dampness. Start uses those saved settings for a new job;
+while mop-paused, Resume cleaning continues the existing task.
 
 Changing settings does not move the robot. A missing/unsafe journal, stale
 session, unqualified mode/task state or uncertain earlier operation refuses
@@ -204,7 +223,7 @@ set without discarding any newer unresolved intent. Keep rollback state private.
 To return control to the vendor path, remove the exact DNS override you added
 and stop/disable these services; a new robot connection may be required.
 
-The generated certificate lasts 365 days. Rotate it locally before expiry,
-preserve permissions, and verify a new connection afterward. A partial install
+The generated certificate lasts 365 days. The installer does not schedule renewal.
+Rotate it locally before expiry, preserve permissions, and verify a new connection afterward. A partial install
 is intentionally left stopped for inspection; correct only the identified
 partial resources rather than rerunning against an existing installation.

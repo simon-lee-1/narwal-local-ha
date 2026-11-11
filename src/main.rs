@@ -81,12 +81,13 @@ async fn run(config_path: std::path::PathBuf, mode: RunMode) -> Result<(), Strin
     let e = engine.clone();
     tokio::spawn(async move {
         let mut clock = tokio::time::interval(Duration::from_secs(1));
+        clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             clock.tick().await;
             e.publish().await;
         }
     });
-    if let Some(mqtt) = config.mqtt {
+    let mqtt_task = if let Some(mqtt) = config.mqtt {
         let (tx, rx) = mpsc::channel::<LocalInput>(4);
         let e = engine.clone();
         tokio::spawn(async move {
@@ -95,8 +96,11 @@ async fn run(config_path: std::path::PathBuf, mode: RunMode) -> Result<(), Strin
                 async move {
                     let _ = match input {
                         LocalInput::Command(command) => e.command(command).await.map(|_| ()),
-                        LocalInput::RoomCommand { command, map_id, revision } =>
-                            e.room_command(command, map_id, revision).await.map(|_| ()),
+                        LocalInput::RoomCommand {
+                            command,
+                            map_id,
+                            revision,
+                        } => e.room_command(command, map_id, revision).await.map(|_| ()),
                         LocalInput::SelectRoom(room) => {
                             e.change_mop(narwal_local_service::plan::Change::Room(room))
                                 .await
@@ -120,15 +124,25 @@ async fn run(config_path: std::path::PathBuf, mode: RunMode) -> Result<(), Strin
         let state = engine.states.subscribe();
         let images = engine.images.subscribe();
         let edit_images = engine.edit_images.subscribe();
-        tokio::spawn(async move {
-            if narwal_local_service::mqtt::run(mqtt, state, images, edit_images, tx)
-                .await
-                .is_err()
-            {
-                eprintln!("Narwal service: MQTT bridge stopped");
-            }
-        });
-    }
+        Some(tokio::spawn(narwal_local_service::mqtt::run(
+            mqtt,
+            state,
+            images,
+            edit_images,
+            tx,
+        )))
+    } else {
+        None
+    };
+    let mqtt = async move {
+        match mqtt_task {
+            Some(task) => match task.await {
+                Ok(_) => Err("mqtt_bridge_stopped".into()),
+                Err(_) => Err("mqtt_bridge_task_failed".into()),
+            },
+            None => std::future::pending::<Result<(), String>>().await,
+        }
+    };
     let http = narwal_local_service::http::run(engine.clone(), address);
     if let Some(path) = config.socket_path {
         let executable = config
@@ -137,10 +151,11 @@ async fn run(config_path: std::path::PathBuf, mode: RunMode) -> Result<(), Strin
         tokio::select! {
             result=http=>result,
             result=robot_listener(engine,&path,config.frontend_uid,&executable)=>result,
+            result=mqtt=>result,
             _=shutdown()=>Ok(()),
         }
     } else {
-        tokio::select! {result=http=>result,_=shutdown()=>Ok(())}
+        tokio::select! {result=http=>result,result=mqtt=>result,_=shutdown()=>Ok(())}
     }
 }
 async fn shutdown() {
@@ -218,10 +233,11 @@ async fn robot_listener(
                 let _ = e.refresh_map().await;
             }
             let mut map_refresh = PendingMapRefresh::new(std::time::Instant::now());
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            interval.tick().await;
             loop {
-                interval.tick().await;
+                // A command can hold the serial owner through a long dock
+                // cycle. Space reads after completion instead of replaying
+                // the timer ticks that elapsed while waiting.
+                tokio::time::sleep(Duration::from_secs(10)).await;
                 let _ = e.refresh().await;
                 let unresolved = e.snapshot().await["room_editor"]["unresolved_write"] == true;
                 if map_refresh.should_refresh(unresolved, std::time::Instant::now()) {

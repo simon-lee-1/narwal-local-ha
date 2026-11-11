@@ -85,6 +85,8 @@ pub enum Operation {
         params: Value,
     },
     CommandStatus,
+    /// Matched status and local revision metadata, without a command permit.
+    ObservedStatus,
     GuardedCommand {
         observation: CommandObservation,
         params: Option<Value>,
@@ -263,6 +265,7 @@ struct Pending {
     reply: oneshot::Sender<Result<Value, String>>,
     deadline: Instant,
     command_status: bool,
+    observed_status: bool,
     transport_written: bool,
 }
 
@@ -440,7 +443,9 @@ fn fresh_id() -> Result<String, String> {
 
 fn operation(operation: Operation) -> Result<(&'static str, Value), String> {
     match operation {
-        Operation::Status | Operation::CommandStatus => Ok((INFO, json!("{}"))),
+        Operation::Status | Operation::CommandStatus | Operation::ObservedStatus => {
+            Ok((INFO, json!("{}")))
+        }
         Operation::Map => Ok((
             MAP,
             json!({"operations":["room_attr","clean_order","map_data"]}),
@@ -626,7 +631,14 @@ async fn deliver(
                 return Err(error);
             }
         }
-        let result = if waiting.command_status {
+        let result = if waiting.observed_status {
+            result.and_then(|value| {
+                Ok(json!({
+                    "status": value,
+                    "observation": observation.ok_or("command_state_missing")?
+                }))
+            })
+        } else if waiting.command_status {
             result.and_then(|_| {
                 serde_json::to_value(observation.ok_or("command_state_missing")?)
                     .map_err(|_| "command_observation_encoding_failed".into())
@@ -713,6 +725,17 @@ async fn deliver(
         }
         return Ok(());
     };
+    if pose
+        && !["x", "y"].iter().all(|field| {
+            result
+                .get(*field)
+                .and_then(Value::as_f64)
+                .is_some_and(f64::is_finite)
+        })
+    {
+        status.diagnostics.rejected(PoseRejection::Coordinates);
+        return Ok(());
+    }
     let event = match service {
         Some(INFO) => status_result(result).map(|result| Event::Status { generation, result }),
         Some(POSE) => Some(Event::Pose {
@@ -875,6 +898,7 @@ where
                     }
                 }
                 let command_status = matches!(request.operation, Operation::CommandStatus);
+                let observed_status = matches!(request.operation, Operation::ObservedStatus);
                 let guarded_motion = matches!(request.operation,
                     Operation::GuardedCommand { .. } | Operation::GuardedMapSet { .. });
                 let refused = |error: String| {
@@ -899,7 +923,7 @@ where
                 // Consume this intent before the first write. On ambiguous failure
                 // the caller receives an error; this frame is never replayed.
                 *pending = Some(Pending { request_id, service, reply: request.reply,
-                    deadline: Instant::now() + REPLY_DEADLINE, command_status,
+                    deadline: Instant::now() + REPLY_DEADLINE, command_status, observed_status,
                     transport_written: false });
                 timeout(WRITE_DEADLINE, socket.send(Message::Text(encoded.into()))).await
                     .map_err(|_| "request_write_timeout")?

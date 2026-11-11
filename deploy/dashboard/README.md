@@ -55,6 +55,9 @@ curl --fail --max-time 10 http://127.0.0.1:35394/api/state \
 
 Edit `entities.private.json` in a local editor so every entity ID matches your
 discovered HA entities and `topic_prefix` matches your bridge configuration.
+The prefix follows the same rules as the runtime: 1–256 UTF-8 bytes, nonempty
+slash-separated levels, and no control characters or MQTT wildcards (`+`, `#`).
+Spaces, dots and Unicode are supported and preserved literally.
 The example IDs are placeholders. The initial vacuum object ID may include
 the MQTT client ID; copying the example without checking it is insufficient.
 The map entity must be the discovered native **image** entity.
@@ -88,9 +91,10 @@ Do not commit snapshots or generated dashboards, even to a private repository.
 Create an empty dashboard in Home Assistant, take control of its configuration,
 and paste the generated JSON into its raw configuration editor. A supported
 Lovelace WebSocket save is also suitable; do not edit HA `.storage` files.
-If generating from another computer, use an SSH local forward for the
-loopback HTTP endpoint and transfer private files over your authenticated
-connection.
+If generating from another computer, use the
+[documented SSH local forward](../README.md#connect-and-verify) and the exact
+address `http://127.0.0.1:35394/` for the loopback endpoint. Transfer private
+files over your authenticated connection.
 
 ## Use the map
 
@@ -114,6 +118,16 @@ Mode, job phase, battery, percentage, area and readable errors appear below
 the map. The error card preserves an unknown-code fallback. A fault prevents
 the backend from accepting a new cleaning request. A service-call success
 alone is not proof of motion; follow the current job and command receipt.
+
+When the robot is connected but its map is unavailable, native HA cards keep
+job status, mode, battery, progress, area and dock contact visible. Return to
+dock remains available for Mop and Vacuum; Mop Pause and fault-free Resume
+appear for their corresponding task states. Starting a new room job still
+requires the current interactive map. These fallback cards disappear when
+the map returns, and motion controls disappear when the robot is offline.
+Both HA `unknown` (no accepted image yet) and `unavailable` map states use
+this fallback. Robot availability and current-map availability are separate;
+fresh robot feedback can arrive before the first valid map.
 
 The robot's reported progress and cleaned area may reset or retain previous
 values after docking. The dashboard does not replace them with an invented

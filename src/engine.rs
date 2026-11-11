@@ -18,6 +18,8 @@ const POSE_DISPLAY_TTL: std::time::Duration = std::time::Duration::from_secs(30)
 // Conservative interpolation limits, not validated robot speed/brush width.
 const TRAIL_JOIN_TTL: std::time::Duration = std::time::Duration::from_secs(3);
 const MAX_TRAIL_POINTS: usize = 8192;
+const POSE_IMAGE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1500);
+const COMMAND_ADMISSION_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 
 #[derive(Default)]
 struct CleaningTrail {
@@ -66,6 +68,7 @@ pub struct Engine {
     inner: Arc<Mutex<Inner>>,
     requests: Arc<Mutex<Attachment>>,
     serial: Arc<Mutex<()>>,
+    command_admission: Arc<Mutex<()>>,
     pub states: watch::Sender<Value>,
     pub images: watch::Sender<Option<Vec<u8>>>,
     pub edit_images: watch::Sender<Option<Vec<u8>>>,
@@ -77,6 +80,8 @@ struct Inner {
     editor: editor_runtime::EditorState,
     map_generation: Option<u64>,
     rendered_marker: Option<(u64, u64, &'static str)>,
+    image_rendered_at: Option<Instant>,
+    image_dirty: bool,
     pose: Option<Value>,
     pose_received_at: Option<Instant>,
     pose_diagnostics: Option<(u64, Arc<crate::session::Diagnostics>)>,
@@ -203,6 +208,8 @@ impl Engine {
                 editor: editor_runtime::EditorState::default(),
                 map_generation: None,
                 rendered_marker: None,
+                image_rendered_at: None,
+                image_dirty: false,
                 pose: None,
                 pose_received_at: None,
                 pose_diagnostics: None,
@@ -221,6 +228,7 @@ impl Engine {
             })),
             requests: Arc::new(Mutex::new(None)),
             serial: Arc::new(Mutex::new(())),
+            command_admission: Arc::new(Mutex::new(())),
             states,
             images,
             edit_images,
@@ -251,7 +259,7 @@ impl Engine {
             .filter(|name| crate::control::eligible(&inner.profile, name))
             .cloned()
             .collect();
-        let room_selection = enabled.iter().any(|name| name == "start")
+        let room_capable = enabled.iter().any(|name| name == "start")
             && inner
                 .profile
                 .commands
@@ -259,7 +267,7 @@ impl Engine {
                 .is_some_and(|command| command.rooms_supported);
         value["commands_enabled"] = json!(!enabled.is_empty());
         value["enabled_commands"] = json!(enabled);
-        value["room_selection_enabled"] = json!(room_selection);
+        value["room_selection_enabled"] = json!(room_capable && inner.mop_settings.is_none());
         value["map"] = json!(inner.map);
         value["map_tracking"] = inner.map_tracking(Instant::now());
         value["pose_diagnostics"] = inner.pose_diagnostics(Instant::now());
@@ -283,7 +291,7 @@ impl Engine {
         );
         // This describes the currently usable internal preparation, never an
         // externally callable command or an inferred robot capability.
-        value["room_clean_preparation"] = json!(if room_selection
+        value["room_clean_preparation"] = json!(if room_capable
             && inner.pending_intent.is_none()
             && inner.state.fresh(Instant::now())
             && inner
@@ -346,7 +354,8 @@ impl Engine {
     async fn publish_with_time(&self, pose_time: Option<Instant>) {
         let mut inner = self.inner.lock().await;
         let now = pose_time.unwrap_or_else(Instant::now);
-        if inner.pose.is_some() && inner.fresh_pose(now).is_none() {
+        let pose_expired = inner.pose.is_some() && inner.fresh_pose(now).is_none();
+        if pose_expired {
             inner.clear_pose();
         }
         if !inner.strict_status_fresh(now)
@@ -358,9 +367,14 @@ impl Engine {
             inner.trail.break_segment();
         }
         let marker = inner.marker_key(now);
-        if marker != inner.rendered_marker {
-            self.images.send_replace(inner.map_png(now).ok());
-            inner.rendered_marker = marker;
+        inner.image_dirty |= marker != inner.rendered_marker;
+        let invalidated = pose_expired || (marker.is_none() && inner.rendered_marker.is_some());
+        let render_due = inner.image_rendered_at.is_none_or(|at| {
+            now.checked_duration_since(at)
+                .is_some_and(|age| age >= POSE_IMAGE_INTERVAL)
+        });
+        if inner.image_dirty && (invalidated || render_due) {
+            self.images.send_replace(inner.render_image(now));
         }
         drop(inner);
         self.states.send_replace(self.snapshot().await);
@@ -413,6 +427,7 @@ impl Engine {
                     }
                     Err(error) => {
                         inner.map_error = Some(error);
+                        image_changed = true;
                     }
                 }
             }
@@ -423,15 +438,17 @@ impl Engine {
                 inner.pose_received_at = Some(now);
                 inner.record_trail_pose(now);
                 inner.record_cleaning_layer(now);
-                image_changed = true;
+                inner.image_dirty = true;
+                // An invalid latest position must remove or replace its old
+                // marker immediately; ordinary movement can be coalesced.
+                image_changed = inner.reported_marker(now).is_none();
             }
             _ => {}
         }
         if image_changed {
             // Keep rendering and cache replacement in the state critical section:
             // an older pose render must never overwrite an invalidated image.
-            self.images.send_replace(inner.map_png(now).ok());
-            inner.rendered_marker = inner.marker_key(now);
+            self.images.send_replace(inner.render_image(now));
         }
         drop(inner);
         self.publish_with_time(pose_time).await;
@@ -446,7 +463,7 @@ impl Engine {
         let image = inner.map_png(Instant::now());
         let result = image.as_ref().map(|_| ()).map_err(Clone::clone);
         self.images.send_replace(image.ok());
-        inner.rendered_marker = inner.marker_key(Instant::now());
+        inner.mark_image_rendered(Instant::now());
         drop(inner);
         self.publish().await;
         result
@@ -459,7 +476,7 @@ impl Engine {
                 inner.map_error = Some(error);
             }
         }
-        self.images.send_replace(inner.map_png(Instant::now()).ok());
+        self.images.send_replace(inner.render_image(Instant::now()));
         drop(inner);
         self.publish().await;
     }
@@ -558,7 +575,50 @@ impl Engine {
     }
     pub async fn refresh(&self) -> Result<Value, String> {
         let _guard = self.serial.lock().await;
-        self.request_inner(Operation::Status).await
+        let reconcile = self
+            .inner
+            .lock()
+            .await
+            .pending_intent
+            .as_ref()
+            .is_some_and(|pending| pending.observation.is_some());
+        if !reconcile {
+            return self.request_inner(Operation::Status).await;
+        }
+        // Read in the current session even when a retained intent belongs to
+        // an older connection. That intent must not stop ordinary polling.
+        let generation = self
+            .requests
+            .lock()
+            .await
+            .as_ref()
+            .map(|(generation, _)| *generation)
+            .ok_or("robot_disconnected")?;
+        let result = self
+            .request_for(Some(generation), Operation::ObservedStatus)
+            .await?;
+        let after: CommandObservation = serde_json::from_value(result["observation"].clone())
+            .map_err(|_| "command_observation_refused")?;
+        if after.generation != generation || after.revision == 0 || !result["status"].is_object() {
+            return Err("command_observation_refused".into());
+        }
+        let mut inner = self.inner.lock().await;
+        if inner.state.connected
+            && inner.state.generation == generation
+            && inner.pending_intent.as_ref().is_some_and(|pending| {
+                pending.observation.as_ref().is_some_and(|before| {
+                    before.generation == after.generation && after.follows(before)
+                }) && pending.accepts(&after)
+            })
+        {
+            // This only reconciles one observed wire leg. It never continues
+            // an abandoned task-clear sequence or replays a command. A journal
+            // restored without its source observation cannot take this path.
+            inner.clear_intent()?;
+        }
+        drop(inner);
+        self.publish().await;
+        Ok(result["status"].clone())
     }
     pub async fn refresh_map(&self) -> Result<Value, String> {
         let _guard = self.serial.lock().await;
@@ -610,7 +670,7 @@ impl Engine {
     ) -> Result<Value, String> {
         // The owner is detached from HTTP/MQTT caller cancellation. Its lock and
         // unresolved intent cannot disappear because a browser stops waiting.
-        let guard = match self.serial.clone().try_lock_owned() {
+        let admission = match self.command_admission.clone().try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
                 self.record_refusal(&input.command, "robot_busy").await;
@@ -619,16 +679,27 @@ impl Engine {
         };
         let engine = self.clone();
         let command = input.command.clone();
-        let result = tokio::spawn(async move {
-            let _guard = guard;
-            engine.command_owned(input, binding).await
+        tokio::spawn(async move {
+            let _admission = admission;
+            let result = match tokio::time::timeout(
+                COMMAND_ADMISSION_WAIT,
+                engine.serial.clone().lock_owned(),
+            )
+            .await
+            {
+                Ok(guard) => {
+                    let _guard = guard;
+                    engine.command_owned(input, binding).await
+                }
+                Err(_) => Err("robot_busy".into()),
+            };
+            if let Err(reason) = &result {
+                engine.record_refusal(&command, reason).await;
+            }
+            result
         })
         .await
-        .map_err(|_| "command_owner_failed".to_string())?;
-        if let Err(reason) = &result {
-            self.record_refusal(&command, reason).await;
-        }
-        result
+        .map_err(|_| "command_owner_failed".to_string())?
     }
     async fn record_refusal(&self, command: &str, reason: &str) {
         let command = if ["start", "pause", "stop", "return_to_base", "resume"].contains(&command) {
@@ -1351,16 +1422,8 @@ impl Inner {
             return None;
         }
         let map = self.map.as_ref()?;
-        if let Some(pose) = self.fresh_pose(now) {
-            let point = crate::maps::Point {
-                x: pose.get("x")?.as_f64()?,
-                y: pose.get("y")?.as_f64()?,
-            };
-            map.world_pixel(point.x, point.y)?;
-            let age = now
-                .checked_duration_since(self.pose_received_at?)?
-                .as_secs();
-            return Some((point, "reported_pose", age));
+        if let Some(marker) = self.reported_marker(now) {
+            return Some(marker);
         }
         if self.state.fresh(now)
             && self.state.updated.is_some_and(|updated| {
@@ -1382,6 +1445,31 @@ impl Inner {
             ));
         }
         None
+    }
+    fn reported_marker(&self, now: Instant) -> Option<(crate::maps::Point, &'static str, u64)> {
+        if !self.current_map() {
+            return None;
+        }
+        let pose = self.fresh_pose(now)?;
+        let point = crate::maps::Point {
+            x: pose.get("x")?.as_f64()?,
+            y: pose.get("y")?.as_f64()?,
+        };
+        self.map.as_ref()?.world_pixel(point.x, point.y)?;
+        let age = now
+            .checked_duration_since(self.pose_received_at?)?
+            .as_secs();
+        Some((point, "reported_pose", age))
+    }
+    fn mark_image_rendered(&mut self, now: Instant) {
+        self.rendered_marker = self.marker_key(now);
+        self.image_rendered_at = Some(now);
+        self.image_dirty = false;
+    }
+    fn render_image(&mut self, now: Instant) -> Option<Vec<u8>> {
+        let image = self.map_png(now).ok();
+        self.mark_image_rendered(now);
+        image
     }
     fn marker_key(&self, now: Instant) -> Option<(u64, u64, &'static str)> {
         self.robot_marker(now)

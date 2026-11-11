@@ -112,10 +112,6 @@ fn discovery(config: &MqttConfig, commands: &[&str]) -> Vec<Publication> {
         })
     };
     let mut vacuum = common(None, "");
-    vacuum["object_id"] = json!(format!(
-        "narwal_j1_{}",
-        id.to_ascii_lowercase().replace('-', "_")
-    ));
     vacuum["schema"] = json!("state");
     vacuum["command_topic"] = json!(format!("{prefix}/command"));
     vacuum["state_topic"] = json!(state_topic);
@@ -428,19 +424,12 @@ fn local_input(
     }
     let value = command(config, topic, retain, duplicate, payload, snapshot, elapsed)?;
     if topic == format!("{prefix}/command") {
-        let mop = if value == "start"
-            && snapshot
-                .get("mop_settings")
-                .is_some_and(|value| !value.is_null())
-        {
-            Some(plan_view(snapshot)?.selected)
-        } else {
-            None
-        };
         Some(LocalInput::Command(CommandInput {
             command: value.to_owned(),
             rooms: Vec::new(),
-            mop,
+            // The serial engine reads saved choices after preceding setting
+            // updates. Only an explicit room-clean request pins its own plan.
+            mop: None,
         }))
     } else if topic == format!("{prefix}/room/set") {
         Some(LocalInput::SelectRoom(value.to_owned()))
@@ -583,10 +572,14 @@ fn receipt_fields(value: Option<&Value>) -> Option<Value> {
             "command_state_missing",
             "robot_status_stale",
             "robot_offline",
+            "robot_disconnected",
+            "request_timeout",
             "motion_persistence_failed",
             "motion_persistence_required",
             "room_selection_invalid",
             "room_selection_state_unverified",
+            "room_catalog_changed",
+            "room_catalog_unavailable_or_write_pending",
             "mop_plan_invalid",
             "mop_settings_unavailable",
             "mop_context_refused",
@@ -647,6 +640,9 @@ fn job_status(status: &Value) -> &'static str {
         (Some(600), _, _, _, true) => "Returning to dock",
         (Some(700), _, _, _, true) => "Leaving dock",
         (Some(303), Some(0), Some(3), _, true) => "Paused",
+        (Some(303), Some(0), Some(3), true, _) if status["main_task"] == 1 => {
+            "Docked (cleaning task paused)"
+        }
         (Some(100), Some(0), _, _, _) => "Idle",
         (_, Some(1), _, true, _) => "Dock cycle",
         _ => "Unknown",
@@ -688,7 +684,6 @@ fn state_publication(
     let mut output = json!({
         "online":online(snapshot,elapsed),
         "connected":snapshot.get("connected").and_then(Value::as_bool).unwrap_or(false),
-        "age_seconds":age(snapshot,elapsed),
         "commands_enabled":!enabled_commands(snapshot).is_empty(),
         "enabled_commands":enabled_commands(snapshot),
         "status":snapshot.get("status").filter(|v|v.is_object()).cloned().unwrap_or(json!({})),
@@ -744,6 +739,11 @@ fn state_publication(
         if !online(snapshot, elapsed) || tracking["map_current"] != true || stale {
             tracking["robot"] = json!({"available":false,"source":"unavailable"});
         }
+        // Keep age internally for expiry, without publishing a changing
+        // counter while the robot marker itself is unchanged.
+        if let Some(robot) = tracking["robot"].as_object_mut() {
+            robot.remove("age_seconds");
+        }
         output["map_tracking"] = tracking;
     }
     output["reported_mode"] = json!(match native_mode {
@@ -756,9 +756,8 @@ fn state_publication(
         Some(2 | 3) => json!([1, 2, 3]),
         _ => json!([]),
     };
-    if let Some(state) = state {
-        output["state"] = json!(state);
-    }
+    // An explicit null clears the previous HA activity for unfamiliar feedback.
+    output["state"] = json!(state);
     if washing && state != Some("error") {
         output["activity"] = json!("washing_mop");
     } else if let Some(state) = state {
@@ -818,24 +817,25 @@ fn image_publications(
     image: Option<&[u8]>,
 ) -> Result<Vec<Publication>, String> {
     let mut publications = Vec::new();
-    if let Some(image) = image {
+    let image = image.filter(|image| {
         if image.len() > MAX_IMAGE_BYTES
             || image.len() < 33
             || &image[..8] != b"\x89PNG\r\n\x1a\n"
             || &image[8..16] != b"\0\0\0\rIHDR"
         {
-            return Err("invalid_mqtt_image".into());
+            return false;
         }
         let width = u32::from_be_bytes(image[16..20].try_into().unwrap());
         let height = u32::from_be_bytes(image[20..24].try_into().unwrap());
-        if width == 0
-            || height == 0
-            || width > 8192
-            || height > 8192
-            || u64::from(width) * u64::from(height) > 16_777_216
-        {
-            return Err("invalid_mqtt_image".into());
-        }
+        width > 0
+            && height > 0
+            && width <= 8192
+            && height <= 8192
+            && u64::from(width) * u64::from(height) <= 16_777_216
+    });
+    // A rejected image only makes its image entity unavailable. Telemetry and
+    // commands stay connected, and the next valid image can restore it.
+    if let Some(image) = image {
         publications.push(publication(
             format!("{}/map/image", config.topic_prefix),
             image.to_vec(),
@@ -868,8 +868,32 @@ fn announcement(
 #[derive(Default)]
 struct Availability {
     last: Option<(bool, Instant)>,
+    states: Vec<(Publication, Instant)>,
 }
 impl Availability {
+    fn queue_state(
+        &mut self,
+        outbox: &mut Outbox,
+        value: Publication,
+        now: Instant,
+    ) -> Result<(), String> {
+        let position = self.states.iter().position(|(last, _)| last.topic == value.topic);
+        if position.is_some_and(|position| {
+            let (last, at) = &self.states[position];
+            *last == value && now.saturating_duration_since(*at) < Duration::from_secs(60)
+        }) {
+            return Ok(());
+        }
+        // Remember only successfully queued payloads, so an enqueue error
+        // cannot suppress a later attempt to publish the same state.
+        outbox.push(value.clone())?;
+        if let Some(position) = position {
+            self.states[position] = (value, now);
+        } else {
+            self.states.push((value, now));
+        }
+        Ok(())
+    }
     fn due(&mut self, value: bool, now: Instant) -> bool {
         let due = self.last.is_none_or(|(last, at)| {
             last != value || now.saturating_duration_since(at) >= Duration::from_secs(60)
@@ -934,7 +958,7 @@ fn reconcile(
     published_features: &mut Option<(Vec<&'static str>, Option<u64>, Option<Value>)>,
     now: Instant,
 ) -> Result<(), String> {
-    outbox.push(state_publication(config, snapshot, elapsed)?)?;
+    availability.queue_state(outbox, state_publication(config, snapshot, elapsed)?, now)?;
     let commands = enabled_commands(snapshot);
     let fingerprint = (commands.clone(), snapshot["status"]["clean_mode"].as_u64(),catalog_value(snapshot));
     let catalog_changed = published_features.as_ref().is_none_or(|previous| previous.2 != fingerprint.2);
@@ -943,7 +967,7 @@ fn reconcile(
         *published_features = Some(fingerprint);
     }
     if catalog_changed { outbox.push(catalog_publication(config,snapshot))?; }
-    outbox.push(editor_state_publication(config,snapshot,elapsed))?;
+    availability.queue_state(outbox, editor_state_publication(config,snapshot,elapsed), now)?;
     let current = online(snapshot, elapsed);
     if availability.due(current, now) {
         outbox.push(availability_publication(config, current))?;
@@ -1004,12 +1028,10 @@ pub async fn run(
                         }
                     },
                     _ = tick.tick(), if connected => {
-                        let current = online(&snapshot,observed.elapsed());
-                        if availability.due(current,Instant::now()) {
-                            outbox.push(state_publication(&config,&snapshot,observed.elapsed())?)?;
-                            outbox.push(editor_state_publication(&config,&snapshot,observed.elapsed()))?;
-                            outbox.push(availability_publication(&config,current))?;
-                        }
+                        // Marker expiry can precede robot-status expiry.
+                        // Re-evaluate both; unchanged payloads stay suppressed.
+                        reconcile(&config,&snapshot,observed.elapsed(),&mut outbox,
+                            &mut availability,&mut published_features,Instant::now())?;
                     },
                     event = &mut poll => {
                         match event {
@@ -1032,9 +1054,10 @@ pub async fn run(
                             outbox.extend(announcement(&config,&snapshot,observed.elapsed(),
                                 image.borrow_and_update().as_deref())?)?;
                             outbox.extend(preview_image_publications(&config,edit_image.borrow_and_update().as_deref())?)?;
-                            availability.due(online(&snapshot,observed.elapsed()),Instant::now());
                             published_features = Some((enabled_commands(&snapshot),
                                 snapshot["status"]["clean_mode"].as_u64(),catalog_value(&snapshot)));
+                            reconcile(&config,&snapshot,observed.elapsed(),&mut outbox,
+                                &mut availability,&mut published_features,Instant::now())?;
                         },
                         Ok(Event::Incoming(Incoming::Publish(message))) => {
                             if state.has_changed().map_err(|_|"mqtt_state_closed")? {
@@ -1048,7 +1071,11 @@ pub async fn run(
                                 outbox.extend(announcement(&config,&snapshot,observed.elapsed(),
                                     image.borrow().as_deref())?)?;
                                 outbox.extend(preview_image_publications(&config,edit_image.borrow().as_deref())?)?;
-                                availability.due(online(&snapshot,observed.elapsed()),Instant::now());
+                                // HA birth forces a complete announcement and
+                                // starts a new heartbeat from these queued states.
+                                availability = Availability::default();
+                                reconcile(&config,&snapshot,observed.elapsed(),&mut outbox,
+                                    &mut availability,&mut published_features,Instant::now())?;
                             } else if let Some(value) = local_input(&config,&message.topic,
                                 message.retain,message.dup,&message.payload,&snapshot,observed.elapsed())
                             {
@@ -1160,7 +1187,6 @@ fn editor_discovery(config: &MqttConfig, snapshot: &Value) -> Vec<Publication> {
     let prefix = &config.topic_prefix;
     let common = |name: &str, suffix: &str| {
         json!({"name":name,"unique_id":format!("narwal_local_{id}_{suffix}"),
-            "object_id":format!("narwal_j1_{}_{suffix}",id.to_ascii_lowercase().replace('-',"_")),
             "device":{"identifiers":[format!("narwal_local_{id}")],"name":"Narwal J1",
                 "manufacturer":"Narwal","model":"J1 local replacement"},
             "availability_topic":format!("{prefix}/availability"),
