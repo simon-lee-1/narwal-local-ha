@@ -97,6 +97,12 @@ and matching `CAP_NET_BIND_SERVICE` sets because Linux process inspection must
 allow the backend to verify the peer's `/proc/PID/exe`. Do not replace that
 check with a wider privilege such as `SYS_PTRACE`.
 
+The frontend accepts one robot connection at a time. Blocking TLS socket reads
+and writes time out after 30 seconds, inactive forwarding closes after 90 seconds,
+and the normal close grace period is two seconds. These bounds release a stalled
+connection so later reconnects can be accepted; `-T` alone does not bound the TLS
+handshake or a blocking TLS shutdown.
+
 ## Connect and verify
 
 Once redirected, the official Narwal app may show the robot as offline.
@@ -196,6 +202,11 @@ profile changes can invalidate a journal's qualification.
 
 Install a compatible new binary atomically, retaining root ownership and mode
 0555, then start the service and verify reconnection, telemetry and no replay.
+When upgrading an older frontend, preserve its addresses and certificate paths
+while adding `so-rcvtimeo=30,so-sndtimeo=30` to its `OPENSSL-LISTEN` options and
+`-T90 -t2` before the two socat addresses in its service command. Keep
+`max-children=1` and the source `/32` restriction. Reload systemd after changing
+the unit; verify that an expired connection no longer blocks a new robot session.
 Do not reinitialize the intent journal on upgrade. If an operation was pending,
 follow its resulting robot state and require a fresh explicit command for
 reconciliation; restarting never authorizes a delayed cleaning request.

@@ -95,7 +95,7 @@ openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
     -keyout /var/lib/narwal-local-ha/key.pem -out /var/lib/narwal-local-ha/certificate.pem \
     >/dev/null 2>&1
 chown "$service_uid:$service_gid" /var/lib/narwal-local-ha/{config.json,settings.json,key.pem,certificate.pem}
-printf 'NARWAL_TLS_LISTEN=OPENSSL-LISTEN:443,pf=ip4,bind=%s,range=%s/32,reuseaddr,fork,max-children=1,verify=0,cert=/var/lib/narwal-local-ha/certificate.pem,key=/var/lib/narwal-local-ha/key.pem,openssl-min-proto-version=TLS1.0,openssl-max-proto-version=TLS1.0,ciphers=AES128-SHA:@SECLEVEL=0\n' \
+printf 'NARWAL_TLS_LISTEN=OPENSSL-LISTEN:443,pf=ip4,bind=%s,range=%s/32,reuseaddr,fork,max-children=1,so-rcvtimeo=30,so-sndtimeo=30,verify=0,cert=/var/lib/narwal-local-ha/certificate.pem,key=/var/lib/narwal-local-ha/key.pem,openssl-min-proto-version=TLS1.0,openssl-max-proto-version=TLS1.0,ciphers=AES128-SHA:@SECLEVEL=0\n' \
     "$bind_ip" "$robot_ip" > /etc/narwal-local-ha/frontend.env
 sed "s/@MQTT_IPV4@/$broker_ip/" "$base/narwal-local-ha.service" > /etc/systemd/system/narwal-local-ha.service
 sed "s/@ROBOT_IPV4@/$robot_ip/" "$base/narwal-local-ha-tls.service" > /etc/systemd/system/narwal-local-ha-tls.service
