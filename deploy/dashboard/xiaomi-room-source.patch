@@ -34,12 +34,12 @@
 +        ids.add(id);
 +        let displayLabel: RoomConfig["label"];
 +        const { name, label } = raw;
-+        // ASCII names are already rasterized. Other names remain escaped SVG text.
++        // The bridge marks exactly which labels its raster font painted.
 +        if (typeof name === "string" && name.length > 0 && name.length <= 128
-+            && /[^\x00-\x7f]/.test(name) && !/[\x00-\x1f\x7f-\x9f]/.test(name)
++            && !/[\x00-\x1f\x7f-\x9f]/.test(name)
 +            && label !== null && typeof label === "object") {
 +            const { x, y } = label;
-+            if ([x, y].every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 4096)) {
++            if (label.rendered_in_image !== true && [x, y].every(v => typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 4096)) {
 +                displayLabel = { text: name, x, y, offset_x: 0, offset_y: 0 };
 +            }
 +        }

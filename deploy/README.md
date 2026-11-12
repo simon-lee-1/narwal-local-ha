@@ -7,6 +7,9 @@ unprivileged account. Build with Rust 1.88 or newer using
 On Debian/Ubuntu, runtime installation tools include `socat`, `openssl`,
 `jq`, `iproute2`, and the package providing `libcrypto.so.3`
 (`libssl3` or `libssl3t64`, depending on the distribution).
+socat must be 1.8.0 or newer: the TLS frontend uses socket timeout options
+that the 1.7.4 packages in Debian 12 and Ubuntu 22.04 do not have. Debian 12
+provides 1.8.0 in bookworm-backports. The installer refuses an older socat.
 
 ## Prepare private configuration
 
@@ -43,13 +46,18 @@ from 0 to 255, unique labels up to 128 UTF-8 bytes, and a selected subset.
 `passes` is 1–3; `dampness` is exactly `Normal` or `Wet`.
 
 These settings supply the initial catalog. Once a current robot map arrives,
-its room IDs and names become authoritative. Use the Rooms editor to save
-HA-local names; those aliases persist across map refreshes.
+its room IDs become authoritative, and a configured label is kept as the
+HA-local alias of a matching room the robot leaves unnamed. Id-derived default
+names are not aliases. Use the Rooms editor to change names afterwards;
+aliases persist across map refreshes and
+take precedence over labels edited later in the settings file.
 
 If room IDs are not yet known, the example catalog can be used to establish
-the initial connection only. Leave all cleaning controls untouched, inspect
-the local map, then stop the service and replace the catalog as described below
-before the first Start.
+the initial connection only. Its single-room `Example room` placeholder is
+ignored when binding the first map; it becomes the normal numbered room name.
+Leave all cleaning controls untouched, inspect the local map, then stop the
+service and replace the catalog as described below before
+the first Start.
 
 Keep `topic_prefix` and `client_id` unique per robot. Changing a client ID later
 creates new HA discovery identities. Never share a MQTT identity with a public
@@ -207,6 +215,12 @@ while adding `so-rcvtimeo=30,so-sndtimeo=30` to its `OPENSSL-LISTEN` options and
 `-T90 -t2` before the two socat addresses in its service command. Keep
 `max-children=1` and the source `/32` restriction. Reload systemd after changing
 the unit; verify that an expired connection no longer blocks a new robot session.
+The two socket options need socat 1.8.0 or newer in the copy the unit runs,
+`/opt/narwal-local-ha/socat`. That copy was taken at installation and does not
+follow system package updates; check it with `/opt/narwal-local-ha/socat -V`.
+An older copy exits at start with `unknown option`. TLS frontend errors are
+written to the journal; inspect `journalctl -u narwal-local-ha-tls.service`.
+Replace an older copy with a root-owned mode-0555 copy of a newer socat first.
 Do not reinitialize the intent journal on upgrade. If an operation was pending,
 follow its resulting robot state and require a fresh explicit command for
 reconciliation; restarting never authorizes a delayed cleaning request.
@@ -234,7 +248,45 @@ set without discarding any newer unresolved intent. Keep rollback state private.
 To return control to the vendor path, remove the exact DNS override you added
 and stop/disable these services; a new robot connection may be required.
 
-The generated certificate lasts 365 days. The installer does not schedule renewal.
-Rotate it locally before expiry, preserve permissions, and verify a new connection afterward. A partial install
+### Certificate renewal
+
+The generated certificate lasts 365 days. Check its expiry without reading the
+private key:
+
+```sh
+openssl x509 -in /var/lib/narwal-local-ha/certificate.pem -noout -enddate
+```
+
+The installer does not schedule renewal. On the bridge host, renew before
+expiry during a docked, idle period. Run this as root; it stops the two bridge
+services briefly. Keep the private backup directory for rollback.
+
+```sh
+set -eu
+umask 077
+state_dir=/var/lib/narwal-local-ha
+renew_dir=$(mktemp -d "$state_dir/certificate-renewal.XXXXXXXX")
+cp "$state_dir/key.pem" "$renew_dir/key.before.pem"
+cp "$state_dir/certificate.pem" "$renew_dir/certificate.before.pem"
+openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 365 \
+  -subj /CN=websocket.narwaltech.com \
+  -addext subjectAltName=DNS:websocket.narwaltech.com \
+  -keyout "$renew_dir/key.pem" -out "$renew_dir/certificate.pem"
+openssl x509 -in "$renew_dir/certificate.pem" -noout -checkend 86400
+systemctl stop narwal-local-ha-tls.service narwal-local-ha.service
+install -m 600 -o narwal-local-ha -g narwal-local-ha \
+  "$renew_dir/key.pem" "$state_dir/key.pem"
+install -m 600 -o narwal-local-ha -g narwal-local-ha \
+  "$renew_dir/certificate.pem" "$state_dir/certificate.pem"
+systemctl start narwal-local-ha.service narwal-local-ha-tls.service
+```
+
+Verify a fresh local connection and status after renewal. If startup fails,
+stop both services and restore the two `.before.pem` files with the same
+`install -m 600 -o narwal-local-ha -g narwal-local-ha` command, then restart.
+Do not discard pending command or editor journals. The J1's certificate date
+validation has not been established.
+
+A partial install
 is intentionally left stopped for inspection; correct only the identified
 partial resources rather than rerunning against an existing installation.

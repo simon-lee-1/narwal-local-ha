@@ -10,7 +10,7 @@ input=$1
 binary=$2
 base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
 [[ $input = /* && $binary = /* ]] || fail 'absolute input paths required'
-for command in jq openssl socat systemctl useradd runuser getent realpath stat install sed ss; do
+for command in jq openssl socat systemctl useradd runuser getent realpath stat install sed ss grep; do
     command -v "$command" >/dev/null || fail 'required system tool missing; see deployment guide'
 done
 [[ -f $input && ! -L $input && $(stat -c %a "$input") = 600 && $(stat -c %h "$input") = 1 ]] ||
@@ -19,7 +19,10 @@ input_parent=$(dirname -- "$input")
 [[ $(stat -c %a "$input_parent") = 700 && $(realpath -- "$input_parent") = "$input_parent" ]] ||
     fail 'input parent must be a canonical mode-700 directory'
 [[ -f $binary && ! -L $binary && -x $binary ]] || fail 'release binary is missing'
+# jq reads a stream of documents and would copy every one of them.
+[[ $(jq -s 'length' "$input" 2>/dev/null) = 1 ]] || fail 'invalid installation configuration'
 jq -e '
+  def uint: type == "number" and floor == . and (tostring | test("\\A[0-9]+\\z"));
   def ipv4: type == "string" and
     test("\\A(?:0|[1-9][0-9]{0,2})(?:\\.(?:0|[1-9][0-9]{0,2})){3}\\z") and
     (split(".") | all(.[]; (tonumber >= 0 and tonumber <= 255))) and
@@ -36,24 +39,26 @@ jq -e '
   (.mqtt|type=="object") and
   (.mqtt|keys|sort)==["client_id","host","password","port","topic_prefix","username"] and
   (.mqtt.host|ipv4) and
-  (.mqtt.port|type=="number" and .>=1 and .<=65535 and floor==.) and
+  (.mqtt.port|uint and .>=1 and .<=65535) and
   (.mqtt.username|type=="string" and utf8bytelength>0 and utf8bytelength<=256 and (startswith("REPLACE_")|not)) and
   (.mqtt.password|type=="string" and utf8bytelength>0 and utf8bytelength<=8192 and (startswith("REPLACE_")|not)) and
   (.mqtt.client_id|type=="string" and test("\\A[A-Za-z0-9_-]{1,64}\\z")) and
   (.mqtt.topic_prefix|type=="string" and utf8bytelength>0 and utf8bytelength<=256 and
     (test("[+#[:cntrl:]]")|not) and (split("/")|all(.[];length>0))) and
   (.settings|keys|sort) == ["rooms","selected","version"] and
-  .settings.version == 1 and (.settings.rooms|length>=1 and length<=32) and
+  (.settings.version|uint and .==1) and
+  (.settings.rooms|type=="array" and length>=1 and length<=32) and
   (.settings.rooms|all(.[]; (keys|sort)==["id","name"] and
-    (.id|type=="number" and floor==. and .>=0 and .<=255) and
+    (.id|uint and .<=255) and
     (.name|type=="string" and utf8bytelength>=1 and utf8bytelength<=128 and
       (test("[[:cntrl:]]")|not) and test("\\S")))) and
   ([.settings.rooms[].id]|length == (unique|length)) and
   ([.settings.rooms[].name]|length == (unique|length)) and
   (.settings.selected|keys|sort)==["dampness","passes","rooms"] and
-  (.settings.selected.passes|.==1 or .==2 or .==3) and
+  (.settings.selected.passes|uint and .>=1 and .<=3) and
   (.settings.selected.dampness|.=="Normal" or .=="Wet") and
-  (.settings.selected.rooms|length>=1 and length<=32 and length==(unique|length)) and
+  (.settings.selected.rooms|type=="array" and length>=1 and length<=32 and
+    length==(unique|length) and all(.[]; uint)) and
   ([.settings.rooms[].id] as $ids | .settings.selected.rooms | all(.[]; . as $id | $ids|index($id)!=null))
 ' "$input" >/dev/null 2>&1 || fail 'invalid installation configuration'
 bind_ip=$(jq -r .bind_ipv4 "$input")
@@ -68,6 +73,13 @@ done
 [[ -z $(ss -H -ltn 'sport = :443') ]] || fail 'TCP 443 is already listening'
 socat_source=$(realpath -- "$(command -v socat)")
 [[ $(stat -c %u "$socat_source") = 0 && -f $socat_source ]] || fail 'socat must be root-owned'
+# The frontend bounds stalled TLS reads and writes with socket options that
+# socat has only from 1.8.0. An older socat exits on them at every start,
+# and the unit discards its error output.
+socat_options=$("$socat_source" -hhh 2>&1 || true)
+grep -Eq '^[[:space:]]*so-rcvtimeo[[:space:]]' <<<"$socat_options" &&
+    grep -Eq '^[[:space:]]*so-sndtimeo[[:space:]]' <<<"$socat_options" ||
+    fail 'socat 1.8.0 or newer is required for the TLS frontend'
 openssl version | jq -R -e 'startswith("OpenSSL 3.")' >/dev/null || fail 'OpenSSL 3 is required'
 # All input and destination guards above run before the first installation write.
 useradd --system --user-group --home-dir /var/lib/narwal-local-ha --no-create-home \

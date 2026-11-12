@@ -18,6 +18,10 @@ Install [Config Template Card](https://github.com/custom-cards/config-template-c
 the two draft action buttons. The live maps use the Xiaomi card directly.
 See [FRONTEND.md](FRONTEND.md) for source pins, checksums, build and license details.
 
+Upgrade the bridge and this resource together. Version `narwal-room-source.3`
+uses the bridge's `label.rendered_in_image` metadata to display unsupported
+or overwide names once. Reload the browser after replacing the resource.
+
 Enable the standard Home Assistant MQTT integration and verify the discovered
 entities and native map image. Update the bridge before opening the editor.
 Enable its private `room_editor_file` store as described in
@@ -58,15 +62,14 @@ discovered HA entities and `topic_prefix` matches your bridge configuration.
 The prefix follows the same rules as the runtime: 1–256 UTF-8 bytes, nonempty
 slash-separated levels, and no control characters or MQTT wildcards (`+`, `#`).
 Spaces, dots and Unicode are supported and preserved literally.
-The example IDs are placeholders. The initial vacuum object ID may include
-the MQTT client ID; copying the example without checking it is insufficient.
+The example IDs are placeholders. Discovery does not suggest entity IDs:
+Home Assistant derives them from the device and entity names, as in the
+example, and keeps any ID an existing installation has already registered,
+which may include the MQTT client ID. Copy the actual IDs shown in HA;
+copying the example without checking it is insufficient.
 The map entity must be the discovered native **image** entity.
 The mapping also needs the room catalog/status sensors, proposed-name text,
 split-room selector and draft-preview image discovered by the editor backend.
-New editor discovery object IDs use `narwal_j1_<client_id>_` followed by
-`room_catalog`, `room_editor`, `room_name`, `editor_room` or `room_edit_preview`.
-HA normalizes these into entity IDs and may retain an existing name, so copy
-the actual IDs shown in HA rather than constructing them from this pattern.
 
 Generate immediately after taking the snapshot:
 

@@ -51,6 +51,12 @@ pub enum EditorInput {
     Refresh,
     VerifyCurrentMap {},
 }
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecoveryInput {
+    Motion { command: String },
+    Map { draft_id: String },
+}
 #[derive(Clone)]
 struct Draft {
     id: String,
@@ -377,6 +383,25 @@ impl Inner {
                 let Some(name) = names.get(&room).map(|name| name.trim()) else {
                     continue;
                 };
+                // A label equal to the id-derived default adds nothing, and
+                // storing it as an alias changes the catalog revision. Such
+                // defaults reach here from the previously accepted map and
+                // from the saved settings, where the bridge writes them.
+                if name == format!("Room {}", room + 1) {
+                    continue;
+                }
+                // The shipped first-connection placeholder is not an operator
+                // rename. Bind it to no map and let the normal default appear.
+                if name == "Example room"
+                    && self.editor.accepted_map_id.is_none()
+                    && self.mop_settings.as_ref().is_some_and(|store| {
+                        store.settings().rooms.len() == 1
+                            && store.settings().rooms[0].id == 0
+                            && room == 0
+                    })
+                {
+                    continue;
+                }
                 // Inferred legacy labels must not make a valid native catalog
                 // ambiguous. Explicit saved aliases remain strictly validated.
                 let conflict = attrs.iter().any(|other| {
@@ -464,7 +489,8 @@ impl Inner {
             "name":editor.name,"selected_room":selected_name,
             "capabilities":{"rename":editor.store.is_some(),"split":editor.store.is_some() && editor.geometry_ready,
                 "merge":editor.store.is_some() && editor.geometry_ready,"names_are_local":true},
-            "unresolved_write":pending.is_some()
+            "unresolved_write":pending.is_some(),
+            "pending_draft_id":pending.map(|pending|&pending.draft_id)
         })
     }
     pub(super) fn accept_editor_map(
@@ -559,7 +585,9 @@ impl Inner {
                     "id":room.id, "name":room.name, "outline":room.outline,
                     "default_state":"unselected",
                     "label":{"text":room.name,"x":room.label.map(|point|point[0]),
-                        "y":room.label.map(|point|point[1]),"offset_y":0},
+                        "y":room.label.map(|point|point[1]),"offset_y":0,
+                        "rendered_in_image":self.map_display.room_labels
+                            && rendered.rasterizable_label(&room.name)},
                 })
             })
             .collect();
@@ -625,20 +653,156 @@ impl Inner {
     }
 }
 fn idle(observation: &CommandObservation) -> bool {
-    observation.state
-        == crate::control::StatePredicate {
-            robot_status: 100,
-            work_status: 0,
-            station_contact: true,
-            error_code: 0,
-        }
-        && observation
-            .mop_context
-            .as_ref()
-            .is_some_and(|context| context.idle_mop() || context.idle_vacuum())
-        && observation.clean_order.as_ref().is_some_and(Vec::is_empty)
+    observation.map_edit_idle()
 }
 impl Engine {
+    /// Explicit local recovery only. Never sends a command, map setter or retry.
+    pub async fn recover(&self, input: RecoveryInput) -> Result<Value, String> {
+        let _admission = self.command_admission.lock().await;
+        let _serial = self.serial.lock().await;
+        let result = self.recover_inner(input).await;
+        self.publish().await;
+        result
+    }
+    async fn recovery_idle(&self, generation: u64) -> Result<CommandObservation, String> {
+        let observation = self.command_observation(Some(generation)).await?;
+        let inner = self.inner.lock().await;
+        if !inner.state.connected
+            || inner.state.generation != generation
+            || !inner.state.fresh(Instant::now())
+            || !idle(&observation)
+        {
+            return Err("recovery_idle_docked_required".into());
+        }
+        Ok(observation)
+    }
+    async fn recover_inner(&self, input: RecoveryInput) -> Result<Value, String> {
+        let generation = {
+            let inner = self.inner.lock().await;
+            if !inner.state.connected {
+                return Err("robot_disconnected".into());
+            }
+            match &input {
+                RecoveryInput::Motion { command } => {
+                    if inner
+                        .pending_intent
+                        .as_ref()
+                        .is_none_or(|p| &p.command != command)
+                    {
+                        return Err("recovery_pending_changed".into());
+                    }
+                }
+                RecoveryInput::Map { draft_id } => {
+                    if inner.pending_intent.is_some() {
+                        return Err("previous_motion_intent_unresolved".into());
+                    }
+                    if inner
+                        .editor
+                        .store
+                        .as_ref()
+                        .and_then(|s| s.saved.pending.as_ref())
+                        .is_none_or(|p| &p.draft_id != draft_id)
+                    {
+                        return Err("recovery_pending_changed".into());
+                    }
+                }
+            }
+            inner.state.generation
+        };
+        let mut previous = self.recovery_idle(generation).await?;
+        // Pending starts can have a delayed washing/preparation phase. Require
+        // three independent fully idle readings over twenty seconds, even
+        // when the intent came from a previous process or connection.
+        for _ in 0..2 {
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let next = self.recovery_idle(generation).await?;
+            if !next.follows(&previous) {
+                return Err("recovery_observation_changed".into());
+            }
+            previous = next;
+        }
+        match input {
+            RecoveryInput::Motion { command } => {
+                let mut inner = self.inner.lock().await;
+                if !inner.state.connected
+                    || inner.state.generation != generation
+                    || !inner.state.fresh(Instant::now())
+                {
+                    return Err("connection_changed".into());
+                }
+                if inner
+                    .pending_intent
+                    .as_ref()
+                    .is_none_or(|p| p.command != command)
+                {
+                    return Err("recovery_pending_changed".into());
+                }
+                inner
+                    .intent_store
+                    .as_ref()
+                    .ok_or("motion_persistence_failed")?
+                    .backup_pending(&random_id()?)?;
+                inner.clear_intent()?;
+                Ok(
+                    json!({"abandoned":true,"kind":"motion","robot_commands_sent":0,
+                    "pending_backed_up":true}),
+                )
+            }
+            RecoveryInput::Map { draft_id } => {
+                let raw = self.request_for(Some(generation), Operation::Map).await?;
+                // Check status again after the getter; a job may have started
+                // while the map reply was in flight.
+                let after = self.recovery_idle(generation).await?;
+                if !after.follows(&previous) {
+                    return Err("recovery_observation_changed".into());
+                }
+                let mut inner = self.inner.lock().await;
+                if !inner.state.connected
+                    || inner.state.generation != generation
+                    || !inner.state.fresh(Instant::now())
+                {
+                    return Err("connection_changed".into());
+                }
+                let store = inner
+                    .editor
+                    .store
+                    .as_ref()
+                    .ok_or("editor_store_unavailable")?;
+                let pending = store
+                    .saved
+                    .pending
+                    .as_ref()
+                    .filter(|p| p.draft_id == draft_id)
+                    .ok_or("recovery_pending_changed")?;
+                if map_id(&raw)? != pending.map_id {
+                    return Err("recovery_map_changed".into());
+                }
+                let draft = RoomDraft::new(raw.clone(), store.saved.aliases.clone())?;
+                draft.preview(inner.map_display.transform)?;
+                crate::runtime::backup_pending(&store.path, &draft_id)?;
+                let mut saved = store.saved.clone();
+                saved.last_backup = Some(pending.before.clone());
+                saved.pending = None;
+                inner
+                    .editor
+                    .store
+                    .as_mut()
+                    .ok_or("editor_store_unavailable")?
+                    .replace(saved)?;
+                inner.editor.draft = None;
+                inner.editor.confirmed = false;
+                inner.editor.message = None;
+                inner.accept_editor_map(raw, true)?;
+                inner.map_generation = Some(generation);
+                self.images.send_replace(inner.map_png(Instant::now()).ok());
+                self.edit_images.send_replace(None);
+                Ok(
+                    json!({"abandoned":true,"kind":"map","robot_commands_sent":0,
+                    "pending_backed_up":true,"map_refreshed":true}),
+                )
+            }
+        }
+    }
     pub async fn configure_editor(&self, path: &Path) -> Result<(), String> {
         let store = Store::open(path)?;
         let mut inner = self.inner.lock().await;

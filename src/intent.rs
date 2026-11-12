@@ -108,6 +108,13 @@ fn open_at(directory: &File, name: &CString, flags: i32) -> Result<File, String>
     Ok(file)
 }
 impl Store {
+    pub(crate) fn backup_pending(&self, id: &str) -> Result<(), String> {
+        self.validate_paths()?;
+        if self.failed || self.read()? != self.record || self.record.pending.is_none() {
+            return Err(error());
+        }
+        crate::runtime::backup_pending(&self.path, id)
+    }
     fn locked(path: &Path, profile: &CommandProfile) -> Result<Self, String> {
         let parent = path.parent().ok_or_else(error)?;
         let name = path.file_name().ok_or_else(error)?;

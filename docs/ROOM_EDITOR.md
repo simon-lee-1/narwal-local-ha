@@ -1,5 +1,16 @@
 # Local room editor
 
+Rooms with unsupported outlines, such as enclosed holes, remain available in
+the name selector. The map card publishes only rooms with safe outlines, so
+one such room does not remove the other selectable rooms. Its interior is
+never filled by an approximate outer polygon. Boundary editing remains
+unavailable when the map fails the editor's geometry checks.
+
+An acknowledged Save with a different map getter retains its pending write.
+For an explicit recovery procedure, see [CONTROL.md](CONTROL.md#local-diagnostics-and-explicit-recovery).
+Recovery preserves the pending store privately, reads the actual map, and
+sends no map replacement. A failed Save is not marked successful by recovery.
+
 The Rooms dashboard prepares one edit at a time: rename one room, merge two
 adjacent rooms, or split a selected room using a two-point line. The Rust
 backend owns validation, draft geometry, persistence and map-write delivery.

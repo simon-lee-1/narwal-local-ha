@@ -109,6 +109,7 @@ fn router(app: Arc<App>) -> Router {
         .route("/api/map/refresh", post(refresh_map))
         .route("/api/telemetry/request_positions", post(request_positions))
         .route("/api/command", post(command))
+        .route("/api/recovery", post(recovery))
         .route("/api/room-editor", post(room_editor))
         .route("/api/room-editor/name", post(editor_name))
         .route("/api/room-editor/room", post(editor_room))
@@ -162,6 +163,12 @@ async fn command(
     Json(input): Json<crate::control::CommandInput>,
 ) -> Response {
     operation_response(app.engine.command(input).await)
+}
+async fn recovery(
+    State(app): State<Arc<App>>,
+    Json(input): Json<crate::engine::RecoveryInput>,
+) -> Response {
+    operation_response(app.engine.recover(input).await)
 }
 async fn room_editor(
     State(app): State<Arc<App>>,
@@ -257,7 +264,7 @@ const PAGE: &str = r##"<!doctype html>
 const token="__TOKEN__", $=id=>document.getElementById(id);
 let current=null,busy=false,loading=false,selected=new Set(),lastImageKey="";
 const commands=["start","pause","return_to_base"];
-const labelRoom=r=>typeof r.name==="string"&&r.name.trim()?r.name:"Room "+r.room_id;
+const labelRoom=r=>typeof r.name==="string"&&r.name.trim()?r.name:"Room "+(r.room_id+1);
 function message(text,error=false){$("message").textContent=text;$("message").classList.toggle("error",error);}
 function shown(value){return value===undefined||value===null?"—":String(value);}
 function render(s){
@@ -295,8 +302,11 @@ function render(s){
   const key=JSON.stringify([map.map_id,map.width,map.height,online?Math.floor(Date.now()/3000):"stored"]);
   if(key!==lastImageKey){$("map-image").src="/map.png?v="+Date.now();lastImageKey=key;}
   const svg=$("map-labels");svg.setAttribute("viewBox","0 0 "+map.width+" "+map.height);svg.replaceChildren();
-  for(const room of rooms)if(Number.isFinite(room.label_x)&&Number.isFinite(room.label_y)){
-   const text=document.createElementNS("http://www.w3.org/2000/svg","text");text.setAttribute("x",String(room.label_x));text.setAttribute("y",String(room.label_y));text.setAttribute("class","room-label");text.setAttribute("font-size",String(Math.max(1,map.width/40)));text.setAttribute("stroke-width",String(Math.max(.15,map.width/200)));text.textContent=labelRoom(room);svg.appendChild(text);
+  // Anchors are pixel centres in the transformed image. The PNG already carries
+  // Supported, fitting names when room_labels is on; add only the others.
+  const display=s.map_tracking&&s.map_tracking.display||{},labels=Array.isArray(display.labels)?display.labels:[];
+  for(const label of labels)if(Number.isFinite(label.x)&&Number.isFinite(label.y)&&typeof label.text==="string"&&!(display.room_labels===true&&label.rasterizable===true)){
+   const text=document.createElementNS("http://www.w3.org/2000/svg","text");text.setAttribute("x",String(label.x+.5));text.setAttribute("y",String(label.y+.5));text.setAttribute("class","room-label");text.setAttribute("font-size",String(Math.max(1,map.width/40)));text.setAttribute("stroke-width",String(Math.max(.15,map.width/200)));text.textContent=label.text;svg.appendChild(text);
   }
  }else{$("map-caption").textContent=s.map_error?"Map unavailable: "+s.map_error:"Waiting for a reported map";}
  const last=s.last_command;$("last-command").textContent=last?"Last command: "+last.command+" · "+(last.verified?"expected state observed":last.outcome||"awaiting feedback"):"";
@@ -304,7 +314,7 @@ function render(s){
 function selection(rooms,allowed){
  const settings=current&&current.mop_settings,plan=settings&&settings.selected;
  if(plan&&Array.isArray(settings.rooms)&&Array.isArray(plan.rooms)){
-  const names=plan.rooms.map(id=>{const room=settings.rooms.find(room=>room.id===id);return room?room.name:"Room "+id;});
+  const names=plan.rooms.map(id=>{const room=settings.rooms.find(room=>room.id===id);return room?room.name:"Room "+(id+1);});
   const dampness=current.status&&current.status.clean_mode===3?" · "+plan.dampness:"";
   $("room-selection").textContent="Saved plan: "+names.join(", ")+" · "+plan.passes+" pass"+(plan.passes===1?"":"es")+dampness;return;
  }
@@ -313,7 +323,7 @@ function selection(rooms,allowed){
 async function load(){if(loading)return;loading=true;try{const response=await fetch("/api/state",{cache:"no-store",signal:AbortSignal.timeout(5000)});if(!response.ok)throw new Error("Cannot read local service");render(await response.json());}catch(error){$("online").textContent="Service unavailable";$("online").classList.remove("online");for(const command of commands)$(command).disabled=true;$("refresh").disabled=true;$("read-map").disabled=true;message(error.message,true);}finally{loading=false;}}
 async function send(path,body){
  if(busy)return;busy=true;if(current)render(current);message("Waiting for the robot…");
- try{const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Narwal-CSRF":token},body:JSON.stringify(body),cache:"no-store",signal:AbortSignal.timeout(90000)});
+ try{const response=await fetch(path,{method:"POST",headers:{"Content-Type":"application/json","X-Narwal-CSRF":token},body:JSON.stringify(body),cache:"no-store",signal:AbortSignal.timeout(360000)});
   const value=await response.json();if(!response.ok)throw new Error(value.error||"Request refused");
   message(path==="/api/command"?(value.verified?"Expected robot state observed.":"Request finished; check the reported state above."):"Robot feedback received.");
  }catch(error){message(error.message,true);}finally{busy=false;await load();}

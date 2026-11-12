@@ -96,6 +96,7 @@ pub struct DisplayLabel {
     pub source: &'static str,
     pub x: u32,
     pub y: u32,
+    pub rasterizable: bool,
 }
 
 /// A card-selectable room boundary. Coordinates are displayed image pixels.
@@ -970,15 +971,17 @@ impl RoomMap {
                     return None;
                 }
                 let (x, y) = transform.pixel(self.width, self.height, x, y);
+                let text = room
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("Room {}", room.room_id + 1));
                 Some(DisplayLabel {
                     room_id: room.room_id,
-                    text: room
-                        .name
-                        .as_deref()
-                        .map(str::trim)
-                        .filter(|name| !name.is_empty())
-                        .map(str::to_owned)
-                        .unwrap_or_else(|| format!("Room {}", room.room_id + 1)),
+                    rasterizable: self.rasterizable_label(&text),
+                    text,
                     source: if room
                         .name
                         .as_deref()
@@ -996,9 +999,8 @@ impl RoomMap {
     }
 
     fn room_label(&self, rgba: &mut [u8], label: &DisplayLabel) {
-        // The native card renders the full Unicode label. Avoid corrupt partial
-        // text in this small ASCII raster font.
-        if !label.text.is_ascii() {
+        // SVG text handles names the small raster font cannot paint in full.
+        if !label.rasterizable {
             return;
         }
         let width = label.text.len() as u32 * 4 + 3;
@@ -1062,6 +1064,17 @@ impl RoomMap {
                 }
             }
         }
+    }
+
+    pub(crate) fn rasterizable_label(&self, text: &str) -> bool {
+        text.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b" .-".contains(&b))
+            && text
+                .len()
+                .checked_mul(4)
+                .and_then(|w| w.checked_add(3))
+                .is_some_and(|width| width <= self.width as usize)
+            && self.height >= 9
     }
 
     fn route_line(&self, rgba: &mut [u8], from: (i32, i32), to: (i32, i32)) {

@@ -891,11 +891,11 @@ where
                         continue;
                     }
                 }
-                if let Operation::GuardedMapSet { observation, .. } = &request.operation {
-                    if let Err(reason) = status.consume(observation, generation) {
-                        let _ = request.reply.send(Ok(before_send_refused(&reason)));
-                        continue;
-                    }
+                if let Operation::GuardedMapSet { observation, .. } = &request.operation
+                    && let Err(reason) = status.consume(observation, generation)
+                {
+                    let _ = request.reply.send(Ok(before_send_refused(&reason)));
+                    continue;
                 }
                 let command_status = matches!(request.operation, Operation::CommandStatus);
                 let observed_status = matches!(request.operation, Operation::ObservedStatus);

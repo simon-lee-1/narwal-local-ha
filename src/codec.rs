@@ -140,7 +140,6 @@ fn parse(raw: &[u8]) -> Option<Value> {
     serde_json::from_slice::<Strict>(raw).ok().map(|s| s.0)
 }
 
-
 /// Decode a canonical encrypted object or a strict plain announcement object.
 /// The wire-message budget includes base64 overhead; no session history is kept.
 pub(crate) fn decode_object(raw: &[u8]) -> Option<Value> {
@@ -243,4 +242,3 @@ pub(crate) fn encode_object(v: &serde_json::Value) -> Option<Vec<u8>> {
         .into_bytes();
     (encoded.len() <= MESSAGE_CAP).then_some(encoded)
 }
-

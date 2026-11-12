@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, mpsc, watch};
 #[path = "editor_runtime.rs"]
 mod editor_runtime;
 pub(crate) use editor_runtime::validate_editor_bytes;
-pub use editor_runtime::{DraftEdit, EditorInput};
+pub use editor_runtime::{DraftEdit, EditorInput, RecoveryInput};
 
 // Display policy, independent of status freshness or the robot's reporting cadence.
 const POSE_DISPLAY_TTL: std::time::Duration = std::time::Duration::from_secs(30);
@@ -308,6 +308,7 @@ impl Engine {
             None
         });
         value["motion_intent_unresolved"] = json!(inner.pending_intent.is_some());
+        value["motion_pending_command"] = json!(inner.pending_intent.as_ref().map(|p| &p.command));
         value["motion_persistence_ready"] = json!(inner.motion_ready());
         value
     }
@@ -471,10 +472,10 @@ impl Engine {
     pub async fn configure_map_display(&self, display: crate::maps::MapDisplay) {
         let mut inner = self.inner.lock().await;
         inner.map_display = display;
-        if let Some(raw) = inner.raw_map.clone() {
-            if let Err(error) = inner.accept_editor_map(raw, false) {
-                inner.map_error = Some(error);
-            }
+        if let Some(raw) = inner.raw_map.clone()
+            && let Err(error) = inner.accept_editor_map(raw, false)
+        {
+            inner.map_error = Some(error);
         }
         self.images.send_replace(inner.render_image(Instant::now()));
         drop(inner);

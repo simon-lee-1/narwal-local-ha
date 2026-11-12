@@ -99,7 +99,11 @@ fn current_rooms(state: &Value) -> Result<(String, Vec<Value>), String> {
         display["coordinate_space"] == "display_pixels",
         "room coordinates are not display pixels",
     )?;
-    let map_id = state["map"]["map_id"].as_str().ok_or("missing map ID")?;
+    let map_id = state["map"]["map_id"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| state["map"]["map_id"].as_u64().map(|id| id.to_string()))
+        .ok_or("missing map ID")?;
     // The map pin is inserted into a HA template in Mop mode. Constrain its
     // representation so a map ID cannot introduce template expressions.
     require(
@@ -147,10 +151,9 @@ fn current_rooms(state: &Value) -> Result<(String, Vec<Value>), String> {
             found.insert(id),
             "duplicate configured room in map metadata",
         )?;
-        require(
-            room["outline_error"].is_null(),
-            "configured room has an ambiguous or unavailable outline",
-        )?;
+        if !room["outline_error"].is_null() {
+            continue;
+        }
         let outline = room["outline"].as_array().ok_or("missing room outline")?;
         require(
             outline.len() >= 3 && outline.len() <= 65536,
@@ -168,7 +171,8 @@ fn current_rooms(state: &Value) -> Result<(String, Vec<Value>), String> {
         rooms.push(json!({"id":id, "outline":outline, "default_state":"unselected"}));
     }
     require(found == allowed, "configured room missing from current map")?;
-    Ok((map_id.to_owned(), rooms))
+    require(!rooms.is_empty(), "no selectable room outlines")?;
+    Ok((map_id, rooms))
 }
 
 fn action(service: &str, e: &Entities) -> Value {

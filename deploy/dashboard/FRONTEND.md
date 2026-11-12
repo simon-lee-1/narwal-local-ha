@@ -3,16 +3,18 @@
 The included Xiaomi card resource is built from
 [`045c3ac946d4ef0a01201f306e9949643984a155`](https://github.com/PiotrMachowski/Lovelace-Xiaomi-Vacuum-Map-card/tree/045c3ac946d4ef0a01201f306e9949643984a155)
 plus [xiaomi-room-source.patch](xiaomi-room-source.patch). Its local display
-version is `narwal-room-source.2`; this is not an upstream release tag.
+version is `narwal-room-source.3`; this is not an upstream release tag.
 The original interface was previously exercised with upstream v2.4.1.
 
 The patch adds one optional `room_source` entity to a map preset. That sensor
 supplies current display-pixel room polygons, a map ID and catalog revision.
 The card reads them as data, admits only bounded numeric polygons and safe
 pins, and ignores incoming actions, variables and arbitrary label options.
-For non-ASCII room names, it copies only bounded plain text and a finite,
-bounded label position into escaped SVG text with zero offsets. ASCII names
-remain in the raster map, avoiding duplicate labels. No label background is added.
+The bridge marks labels actually painted into the image with
+`label.rendered_in_image: true`. Other names, including unsupported punctuation,
+Unicode and labels too wide for the raster font, use bounded plain text and a
+finite, bounded position in escaped SVG text with zero offsets. This also works
+when raster room labels are disabled. No label background is added.
 Catalog changes clear selection. Ordinary HA updates continue through the
 card, preserving the moving robot and current selection. Missing or invalid
 catalog data clears selection and prevents dispatch.
@@ -26,7 +28,7 @@ The resource [resources/xiaomi-vacuum-map-card.js](resources/xiaomi-vacuum-map-c
 has SHA-256:
 
 ```text
-12f8649217d197791fd6fe7657854886f4453a1034a8a1084e0944d6d61f618d
+2a4b045decd3e2fefbc99867de7b9fbffb37573a8b36b470f96017b99ca5a5b8
 ```
 
 It is UTF-8 JavaScript with no source map, captured map, runtime credentials

@@ -379,7 +379,12 @@ fn room_clean_input(
     let request: RoomCleanRequest = serde_json::from_slice(payload).ok()?;
     if request.map_id.is_empty()
         || request.map_id.len() > 256
-        || snapshot["map"]["map_id"].as_str() != Some(request.map_id.as_str())
+        || snapshot["map"]["map_id"]
+            .as_str()
+            .map(str::to_owned)
+            .or_else(|| snapshot["map"]["map_id"].as_u64().map(|id| id.to_string()))
+            .as_deref()
+            != Some(request.map_id.as_str())
         || !editor_token(&request.revision)
         || snapshot["room_catalog"]["map_id"].as_str() != Some(request.map_id.as_str())
         || snapshot["room_catalog"]["revision"].as_str() != Some(request.revision.as_str())
@@ -492,16 +497,37 @@ fn checked_state(snapshot: &Value) -> Result<(), String> {
         }
     }
     fn without_fields(value: &Value, paths: &[&[&str]]) -> Value {
-        let Some(fields) = value.as_object() else { return value.clone(); };
-        Value::Object(fields.iter().filter_map(|(name, child)| {
-            if paths.iter().any(|path| path.len()==1 && path[0]==name) { return None; }
-            let child_paths: Vec<_> = paths.iter().filter(|path| path.len()>1 && path[0]==name)
-                .map(|path| &path[1..]).collect();
-            Some((name.clone(), if child_paths.is_empty() {child.clone()}
-                else {without_fields(child,&child_paths)}))
-        }).collect())
+        let Some(fields) = value.as_object() else {
+            return value.clone();
+        };
+        Value::Object(
+            fields
+                .iter()
+                .filter_map(|(name, child)| {
+                    if paths.iter().any(|path| path.len() == 1 && path[0] == name) {
+                        return None;
+                    }
+                    let child_paths: Vec<_> = paths
+                        .iter()
+                        .filter(|path| path.len() > 1 && path[0] == name)
+                        .map(|path| &path[1..])
+                        .collect();
+                    Some((
+                        name.clone(),
+                        if child_paths.is_empty() {
+                            child.clone()
+                        } else {
+                            without_fields(child, &child_paths)
+                        },
+                    ))
+                })
+                .collect(),
+        )
     }
-    let bounded = without_fields(snapshot,&[&["room_catalog"],&["map_tracking","display","rooms"]]);
+    let bounded = without_fields(
+        snapshot,
+        &[&["room_catalog"], &["map_tracking", "display", "rooms"]],
+    );
     serde_json::to_writer(Limited(Vec::new()), &bounded).map_err(|_| "invalid_mqtt_state".into())
 }
 fn receipt_fields(value: Option<&Value>) -> Option<Value> {
@@ -551,13 +577,25 @@ fn receipt_fields(value: Option<&Value>) -> Option<Value> {
     if ["start", "vacuum_start"].contains(&command)
         && let Some(rooms) = source.get("requested_rooms").and_then(Value::as_array)
         && (1..=32).contains(&rooms.len())
-        && let Some(order) = source.get("requested_clean_order").and_then(Value::as_array)
+        && let Some(order) = source
+            .get("requested_clean_order")
+            .and_then(Value::as_array)
         && (1..=96).contains(&order.len())
-        && rooms.iter().all(|room| room.as_u64().is_some_and(|id| id <= 255))
-        && rooms.iter().enumerate().all(|(index, room)| !rooms[..index].contains(room))
-        && order.iter().all(|room| room.as_u64().is_some_and(|id| id <= 255))
+        && rooms
+            .iter()
+            .all(|room| room.as_u64().is_some_and(|id| id <= 255))
+        && rooms
+            .iter()
+            .enumerate()
+            .all(|(index, room)| !rooms[..index].contains(room))
+        && order
+            .iter()
+            .all(|room| room.as_u64().is_some_and(|id| id <= 255))
         && (1..=3).any(|passes| {
-            rooms.iter().flat_map(|room| std::iter::repeat_n(room, passes)).eq(order.iter())
+            rooms
+                .iter()
+                .flat_map(|room| std::iter::repeat_n(room, passes))
+                .eq(order.iter())
         })
     {
         result["requested_rooms"] = json!(rooms);
@@ -605,7 +643,9 @@ fn public_receipt(value: Option<&Value>) -> Option<Value> {
     // copy arbitrary peer data or expand the public MQTT command whitelist.
     if result["command"] == "start"
         && let Some(preparation) = value.and_then(|source| source.get("preparation"))
-        && preparation.get("command").and_then(Value::as_str)
+        && preparation
+            .get("command")
+            .and_then(Value::as_str)
             .is_some_and(|command| ["end_task", "vacuum_end_task"].contains(&command))
         && let Some(preparation) = receipt_fields(Some(preparation))
     {
@@ -877,7 +917,10 @@ impl Availability {
         value: Publication,
         now: Instant,
     ) -> Result<(), String> {
-        let position = self.states.iter().position(|(last, _)| last.topic == value.topic);
+        let position = self
+            .states
+            .iter()
+            .position(|(last, _)| last.topic == value.topic);
         if position.is_some_and(|position| {
             let (last, at) = &self.states[position];
             *last == value && now.saturating_duration_since(*at) < Duration::from_secs(60)
@@ -960,14 +1003,26 @@ fn reconcile(
 ) -> Result<(), String> {
     availability.queue_state(outbox, state_publication(config, snapshot, elapsed)?, now)?;
     let commands = enabled_commands(snapshot);
-    let fingerprint = (commands.clone(), snapshot["status"]["clean_mode"].as_u64(),catalog_value(snapshot));
-    let catalog_changed = published_features.as_ref().is_none_or(|previous| previous.2 != fingerprint.2);
+    let fingerprint = (
+        commands.clone(),
+        snapshot["status"]["clean_mode"].as_u64(),
+        catalog_metadata(snapshot),
+    );
+    let catalog_changed = published_features
+        .as_ref()
+        .is_none_or(|previous| previous.2 != fingerprint.2);
     if published_features.as_ref() != Some(&fingerprint) {
         outbox.extend(configured_discovery(config, &commands, snapshot))?;
         *published_features = Some(fingerprint);
     }
-    if catalog_changed { outbox.push(catalog_publication(config,snapshot))?; }
-    availability.queue_state(outbox, editor_state_publication(config,snapshot,elapsed), now)?;
+    if catalog_changed {
+        outbox.push(catalog_publication(config, snapshot))?;
+    }
+    availability.queue_state(
+        outbox,
+        editor_state_publication(config, snapshot, elapsed),
+        now,
+    )?;
     let current = online(snapshot, elapsed);
     if availability.due(current, now) {
         outbox.push(availability_publication(config, current))?;
@@ -1055,7 +1110,7 @@ pub async fn run(
                                 image.borrow_and_update().as_deref())?)?;
                             outbox.extend(preview_image_publications(&config,edit_image.borrow_and_update().as_deref())?)?;
                             published_features = Some((enabled_commands(&snapshot),
-                                snapshot["status"]["clean_mode"].as_u64(),catalog_value(&snapshot)));
+                                snapshot["status"]["clean_mode"].as_u64(),catalog_metadata(&snapshot)));
                             reconcile(&config,&snapshot,observed.elapsed(),&mut outbox,
                                 &mut availability,&mut published_features,Instant::now())?;
                         },
@@ -1109,23 +1164,30 @@ pub async fn run(
     }
 }
 
-
-
 const MAX_CATALOG_BYTES: usize = 512 * 1024;
 const MAX_EDITOR_BYTES: usize = 2048;
 
 fn editor_token(value: &str) -> bool {
-    !value.is_empty() && value.len() <= 256
-        && value.bytes().all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
+    !value.is_empty()
+        && value.len() <= 256
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b))
 }
-fn catalog_value(snapshot: &Value) -> Option<Value> {
+fn catalog_metadata(snapshot: &Value) -> Option<Value> {
     let source = snapshot.get("room_catalog")?;
     for field in ["map_id", "revision"] {
-        if !editor_token(source[field].as_str()?) { return None; }
+        if !editor_token(source[field].as_str()?) {
+            return None;
+        }
     }
-    if source["coordinate_space"] != "display_pixels" { return None; }
+    if source["coordinate_space"] != "display_pixels" {
+        return None;
+    }
     let rooms = source["rooms"].as_array()?;
-    if rooms.is_empty() || rooms.len() > 32 { return None; }
+    if rooms.is_empty() || rooms.len() > 32 {
+        return None;
+    }
     let mut result = Vec::new();
     let mut ids = Vec::new();
     let mut names = Vec::new();
@@ -1133,24 +1195,40 @@ fn catalog_value(snapshot: &Value) -> Option<Value> {
     for room in rooms {
         let id = room["id"].as_u64().filter(|id| *id < 63)?;
         let name = room["name"].as_str()?;
-        if ids.contains(&id) || names.contains(&name) || name.is_empty() || name.len() > 128
-            || name.chars().any(char::is_control) { return None; }
-        ids.push(id); names.push(name);
+        if ids.contains(&id)
+            || names.contains(&name)
+            || name.is_empty()
+            || name.len() > 128
+            || name.chars().any(char::is_control)
+        {
+            return None;
+        }
+        ids.push(id);
+        names.push(name);
         let outline = room["outline"].as_array()?;
         total_points = total_points.checked_add(outline.len())?;
-        if outline.len() < 3 || total_points > 32768 { return None; }
+        if (!outline.is_empty() && outline.len() < 3) || total_points > 32768 {
+            return None;
+        }
         for point in outline {
             let point = point.as_array()?;
-            if point.len() != 2 || point.iter().any(|v|
-                !v.as_f64().is_some_and(|n| n.is_finite() && (0.0..=8192.0).contains(&n)))
-            { return None; }
+            if point.len() != 2
+                || point.iter().any(|v| {
+                    !v.as_f64()
+                        .is_some_and(|n| n.is_finite() && (0.0..=8192.0).contains(&n))
+                })
+            {
+                return None;
+            }
         }
         let mut out = json!({"id":id,"name":name,"outline":outline,"default_state":"unselected"});
         if let Some(label) = room.get("label")
             && let (Some(x), Some(y)) = (label["x"].as_f64(), label["y"].as_f64())
-            && x.is_finite() && y.is_finite()
+            && x.is_finite()
+            && y.is_finite()
         {
-            out["label"] = json!({"text":name,"x":x,"y":y,"offset_y":0});
+            out["label"] = json!({"text":name,"x":x,"y":y,"offset_y":0,
+                "rendered_in_image":label["rendered_in_image"] == true});
         }
         result.push(out);
     }
@@ -1158,29 +1236,65 @@ fn catalog_value(snapshot: &Value) -> Option<Value> {
         "coordinate_space":"display_pixels","rooms":result});
     (serde_json::to_vec(&value).ok()?.len() <= MAX_CATALOG_BYTES).then_some(value)
 }
-fn catalog_publication(config: &MqttConfig, snapshot: &Value) -> Publication {
-    json_publication(format!("{}/room_catalog",config.topic_prefix),
-        catalog_value(snapshot).unwrap_or(json!({"revision":null,"rooms":[]})))
+fn catalog_value(snapshot: &Value) -> Option<Value> {
+    let mut catalog = catalog_metadata(snapshot)?;
+    // A missing outline must not erase healthy rooms or fabricate coverage
+    // over an interior hole. Keep all names available to the separate editor.
+    catalog["rooms"].as_array_mut()?.retain(|r| {
+        r["outline"]
+            .as_array()
+            .is_some_and(|outline| outline.len() >= 3)
+    });
+    (!catalog["rooms"].as_array()?.is_empty()).then_some(catalog)
 }
-fn editor_state_publication(config: &MqttConfig, snapshot: &Value, elapsed: Duration) -> Publication {
+fn catalog_publication(config: &MqttConfig, snapshot: &Value) -> Publication {
+    json_publication(
+        format!("{}/room_catalog", config.topic_prefix),
+        catalog_value(snapshot).unwrap_or(json!({"revision":null,"rooms":[]})),
+    )
+}
+fn editor_state_publication(
+    config: &MqttConfig,
+    snapshot: &Value,
+    elapsed: Duration,
+) -> Publication {
     let source = &snapshot["room_editor"];
-    let allowed = ["idle","draft_ready","draft_blocked","saving","confirmed","refused","unavailable"];
-    let state = source["state"].as_str().filter(|s| allowed.contains(s)).unwrap_or("unavailable");
-    let fresh = online(snapshot,elapsed);
+    let allowed = [
+        "idle",
+        "draft_ready",
+        "draft_blocked",
+        "saving",
+        "confirmed",
+        "refused",
+        "unavailable",
+    ];
+    let state = source["state"]
+        .as_str()
+        .filter(|s| allowed.contains(s))
+        .unwrap_or("unavailable");
+    let fresh = online(snapshot, elapsed);
     let mut value = json!({"state":if fresh {state}else{"unavailable"},
         "can_save":fresh && state=="draft_ready" && source["can_save"]==true,
         "unresolved_write":source["unresolved_write"]==true});
-    for field in ["draft_id","operation","summary","message","name","selected_room"] {
-        value[field] = source[field].as_str()
-            .filter(|text|text.len()<=512 && !text.chars().any(char::is_control))
-            .map_or(Value::Null, |text|json!(text));
+    for field in [
+        "draft_id",
+        "operation",
+        "summary",
+        "message",
+        "name",
+        "selected_room",
+    ] {
+        value[field] = source[field]
+            .as_str()
+            .filter(|text| text.len() <= 512 && !text.chars().any(char::is_control))
+            .map_or(Value::Null, |text| json!(text));
     }
     value["capabilities"] = json!({
         "rename":source["capabilities"]["rename"]==true,
         "split":source["capabilities"]["split"]==true,
         "merge":source["capabilities"]["merge"]==true,
         "names_are_local":source["capabilities"]["names_are_local"]==true});
-    json_publication(format!("{}/room_editor/state",config.topic_prefix),value)
+    json_publication(format!("{}/room_editor/state", config.topic_prefix), value)
 }
 fn editor_discovery(config: &MqttConfig, snapshot: &Value) -> Vec<Publication> {
     let id = &config.client_id;
@@ -1192,109 +1306,195 @@ fn editor_discovery(config: &MqttConfig, snapshot: &Value) -> Vec<Publication> {
             "availability_topic":format!("{prefix}/availability"),
             "payload_available":"online","payload_not_available":"offline"})
     };
-    let mut catalog = common("Room catalog","room_catalog");
+    let mut catalog = common("Room catalog", "room_catalog");
     catalog["state_topic"] = json!(format!("{prefix}/room_catalog"));
     catalog["value_template"] = json!("{{ value_json.revision | default('unavailable', true) }}");
     catalog["json_attributes_topic"] = catalog["state_topic"].clone();
     catalog["icon"] = json!("mdi:floor-plan");
-    let mut editor = common("Room editor","room_editor");
+    let mut editor = common("Room editor", "room_editor");
     editor["state_topic"] = json!(format!("{prefix}/room_editor/state"));
     editor["value_template"] = json!("{{ value_json.state | default('unavailable') }}");
     editor["json_attributes_topic"] = editor["state_topic"].clone();
-    let mut name = common("Room name","room_name");
+    let mut name = common("Room name", "room_name");
     name["state_topic"] = editor["state_topic"].clone();
     name["value_template"] = json!("{{ value_json.name | default('', true) }}");
     name["command_topic"] = json!(format!("{prefix}/room_editor/name/set"));
-    name["min"] = json!(0); name["max"] = json!(128); name["mode"] = json!("text");
-    name["retain"] = json!(false);name["qos"] = json!(0);name["optimistic"] = json!(false);
-    let mut room = common("Editor room","editor_room");
+    name["min"] = json!(0);
+    name["max"] = json!(128);
+    name["mode"] = json!("text");
+    name["retain"] = json!(false);
+    name["qos"] = json!(0);
+    name["optimistic"] = json!(false);
+    let mut room = common("Editor room", "editor_room");
     room["state_topic"] = editor["state_topic"].clone();
     room["value_template"] = json!("{{ value_json.selected_room | default(none) }}");
     room["command_topic"] = json!(format!("{prefix}/room_editor/room/set"));
-    room["retain"] = json!(false);room["qos"] = json!(0);room["optimistic"] = json!(false);
-    room["options"] = catalog_value(snapshot).map(|value|json!(value["rooms"].as_array().unwrap()
-        .iter().map(|room|room["name"].clone()).collect::<Vec<_>>())).unwrap_or(json!(["Unavailable"]));
-    let mut image = common("Room edit preview","room_edit_preview");
+    room["retain"] = json!(false);
+    room["qos"] = json!(0);
+    room["optimistic"] = json!(false);
+    room["options"] = catalog_metadata(snapshot)
+        .map(|value| {
+            json!(
+                value["rooms"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|room| room["name"].clone())
+                    .collect::<Vec<_>>()
+            )
+        })
+        .unwrap_or(json!(["Unavailable"]));
+    let mut image = common("Room edit preview", "room_edit_preview");
     image.as_object_mut().unwrap().remove("availability_topic");
     image["availability"] = json!([
         {"topic":format!("{prefix}/availability"),"payload_available":"online","payload_not_available":"offline"},
         {"topic":format!("{prefix}/room_editor/preview/availability"),"payload_available":"online","payload_not_available":"offline"}]);
     image["availability_mode"] = json!("all");
     image["image_topic"] = json!(format!("{prefix}/room_editor/preview/image"));
-    image["image_encoding"] = json!("raw");image["content_type"] = json!("image/png");
-    [("sensor","room_catalog",catalog),("sensor","room_editor",editor),("text","room_name",name),
-        ("select","editor_room",room),("image","room_edit_preview",image)]
-        .into_iter().map(|(domain,suffix,value)|
-            json_publication(format!("homeassistant/{domain}/{id}_{suffix}/config"),value)).collect()
+    image["image_encoding"] = json!("raw");
+    image["content_type"] = json!("image/png");
+    [
+        ("sensor", "room_catalog", catalog),
+        ("sensor", "room_editor", editor),
+        ("text", "room_name", name),
+        ("select", "editor_room", room),
+        ("image", "room_edit_preview", image),
+    ]
+    .into_iter()
+    .map(|(domain, suffix, value)| {
+        json_publication(
+            format!("homeassistant/{domain}/{id}_{suffix}/config"),
+            value,
+        )
+    })
+    .collect()
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DraftReference { draft_id: String }
-fn editor_input(suffix: &str, retain: bool, duplicate: bool, payload: &[u8],
-    snapshot: &Value, elapsed: Duration) -> Option<LocalInput>
-{
+struct DraftReference {
+    draft_id: String,
+}
+fn editor_input(
+    suffix: &str,
+    retain: bool,
+    duplicate: bool,
+    payload: &[u8],
+    snapshot: &Value,
+    elapsed: Duration,
+) -> Option<LocalInput> {
     use crate::engine::{DraftEdit, EditorInput};
-    if retain || duplicate || payload.len() > MAX_EDITOR_BYTES || !online(snapshot,elapsed) {
+    if retain || duplicate || payload.len() > MAX_EDITOR_BYTES || !online(snapshot, elapsed) {
         return None;
     }
     if suffix == "refresh" {
         let body: Value = serde_json::from_slice(payload).ok()?;
-        return body.as_object().is_some_and(serde_json::Map::is_empty)
+        return body
+            .as_object()
+            .is_some_and(serde_json::Map::is_empty)
             .then_some(LocalInput::Editor(EditorInput::Refresh));
     }
     let editor = &snapshot["room_editor"];
-    if editor["unresolved_write"]==true || editor["state"]=="saving" { return None; }
+    if editor["unresolved_write"] == true || editor["state"] == "saving" {
+        return None;
+    }
     match suffix {
         "name/set" => {
             let name = std::str::from_utf8(payload).ok()?;
-            (name.len()<=128 && !name.chars().any(char::is_control))
-                .then(||LocalInput::EditorName(name.to_string()))
+            (name.len() <= 128 && !name.chars().any(char::is_control))
+                .then(|| LocalInput::EditorName(name.to_string()))
         }
         "room/set" => {
             let name = std::str::from_utf8(payload).ok()?;
-            catalog_value(snapshot)?["rooms"].as_array()?.iter().any(|room|room["name"]==name)
-                .then(||LocalInput::EditorRoom(name.to_string()))
+            catalog_metadata(snapshot)?["rooms"]
+                .as_array()?
+                .iter()
+                .any(|room| room["name"] == name)
+                .then(|| LocalInput::EditorRoom(name.to_string()))
         }
         "draft" => {
-            if !editor["draft_id"].is_null() || snapshot["map_tracking"]["map_current"]!=true {
+            if !editor["draft_id"].is_null() || snapshot["map_tracking"]["map_current"] != true {
                 return None;
             }
             let edit: DraftEdit = serde_json::from_slice(payload).ok()?;
-            let catalog = catalog_value(snapshot)?;
-            let (operation,map_id,revision,rooms) = match &edit {
-                DraftEdit::Rename{map_id,revision,rooms} if rooms.len()==1 =>
-                    ("rename",map_id,revision,Some(rooms)),
-                DraftEdit::Merge{map_id,revision,rooms} if rooms.len()==2 && rooms[0]!=rooms[1] =>
-                    ("merge",map_id,revision,Some(rooms)),
-                DraftEdit::Split{map_id,revision,line} if line[0]!=line[1] && line.iter().flatten()
-                    .all(|n|n.is_finite() && (0.0..=8192.0).contains(n)) =>
-                    ("split",map_id,revision,None),
+            let catalog = catalog_metadata(snapshot)?;
+            let (operation, map_id, revision, rooms) = match &edit {
+                DraftEdit::Rename {
+                    map_id,
+                    revision,
+                    rooms,
+                } if rooms.len() == 1 => ("rename", map_id, revision, Some(rooms)),
+                DraftEdit::Merge {
+                    map_id,
+                    revision,
+                    rooms,
+                } if rooms.len() == 2 && rooms[0] != rooms[1] => {
+                    ("merge", map_id, revision, Some(rooms))
+                }
+                DraftEdit::Split {
+                    map_id,
+                    revision,
+                    line,
+                } if line[0] != line[1]
+                    && line
+                        .iter()
+                        .flatten()
+                        .all(|n| n.is_finite() && (0.0..=8192.0).contains(n)) =>
+                {
+                    ("split", map_id, revision, None)
+                }
                 _ => return None,
             };
-            if editor["capabilities"][operation]!=true || catalog["map_id"]!=map_id.as_str()
-                || catalog["revision"]!=revision.as_str()
-                || rooms.is_some_and(|rooms|rooms.iter().any(|id|
-                    !catalog["rooms"].as_array().unwrap().iter().any(|room|room["id"]==*id)))
-            { return None; }
-            Some(LocalInput::Editor(EditorInput::Draft{edit}))
+            if editor["capabilities"][operation] != true
+                || catalog["map_id"] != map_id.as_str()
+                || catalog["revision"] != revision.as_str()
+                || rooms.is_some_and(|rooms| {
+                    rooms.iter().any(|id| {
+                        !catalog["rooms"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|room| room["id"] == *id)
+                    })
+                })
+            {
+                return None;
+            }
+            Some(LocalInput::Editor(EditorInput::Draft { edit }))
         }
         "save" | "cancel" => {
             let request: DraftReference = serde_json::from_slice(payload).ok()?;
-            if !editor_token(&request.draft_id) || editor["draft_id"]!=request.draft_id
-                || (suffix=="save" && (editor["state"]!="draft_ready" || editor["can_save"]!=true))
-            { return None; }
-            Some(LocalInput::Editor(if suffix=="save" {EditorInput::Save{draft_id:request.draft_id}}
-                else {EditorInput::Cancel{draft_id:request.draft_id}}))
+            if !editor_token(&request.draft_id)
+                || editor["draft_id"] != request.draft_id
+                || (suffix == "save"
+                    && (editor["state"] != "draft_ready" || editor["can_save"] != true))
+            {
+                return None;
+            }
+            Some(LocalInput::Editor(if suffix == "save" {
+                EditorInput::Save {
+                    draft_id: request.draft_id,
+                }
+            } else {
+                EditorInput::Cancel {
+                    draft_id: request.draft_id,
+                }
+            }))
         }
         _ => None,
     }
 }
 
-fn preview_image_publications(config: &MqttConfig, image: Option<&[u8]>) -> Result<Vec<Publication>, String> {
-    let mut publications=image_publications(config,image)?;
+fn preview_image_publications(
+    config: &MqttConfig,
+    image: Option<&[u8]>,
+) -> Result<Vec<Publication>, String> {
+    let mut publications = image_publications(config, image)?;
     for publication in &mut publications {
-        publication.topic=publication.topic.replacen(&format!("{}/map/",config.topic_prefix),
-            &format!("{}/room_editor/preview/",config.topic_prefix),1);
+        publication.topic = publication.topic.replacen(
+            &format!("{}/map/", config.topic_prefix),
+            &format!("{}/room_editor/preview/", config.topic_prefix),
+            1,
+        );
     }
     Ok(publications)
 }

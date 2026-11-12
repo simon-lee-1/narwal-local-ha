@@ -53,7 +53,7 @@ if (source.split(placeholder).length !== 2 || source.includes("sourceMappingURL"
 const header = "/*! Xiaomi Vacuum Map Card, Copyright (c) 2021 Piotr Machowski, MIT.\n" +
   " * Modified for dynamic room catalogs; upstream 045c3ac946d4ef0a01201f306e9949643984a155.\n" +
   " * Source patch/build instructions and dependency license texts accompany this resource.\n */\n";
-fs.writeFileSync(process.argv[2], header + source.replace(placeholder, "narwal-room-source.2"),
+fs.writeFileSync(process.argv[2], header + source.replace(placeholder, "narwal-room-source.3"),
   {flag: "wx", mode: 0o600});
 JS
 sha256sum "$output"

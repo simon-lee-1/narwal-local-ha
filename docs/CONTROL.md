@@ -1,5 +1,46 @@
 # Command and settings contract
 
+## Local diagnostics and explicit recovery
+
+`narwal-local-service --validate-config-only /absolute/private/config.json`
+validates configuration and existing private stores without initializing
+or changing them. The configured runtime socket directory must exist.
+The optional `map_file` loads a stored map for display; a stored map does not
+qualify as the current connection's map for a room command or editor Save.
+
+The following loopback HTTP actions require an exact local Host, same Origin,
+JSON content type and the `X-Narwal-CSRF` token issued by the local page.
+Requests are serialized with normal commands. A browser timeout is never
+permission to resend a command; read the current status first.
+
+| Endpoint | JSON body | Effect |
+|---|---|---|
+| `/api/refresh` | `{}` | Matched status read |
+| `/api/map/refresh` | `{}` | Matched map read |
+| `/api/telemetry/request_positions` | `{}` | Fixed captured app-online frame requesting pose reports |
+| `/api/command` | Existing command input described below | Guarded local command |
+| `/api/recovery` | `{"action":"motion","command":"<motion_pending_command>"}` | Explicitly abandon the referenced pending motion intent |
+| `/api/recovery` | `{"action":"map","draft_id":"<room_editor.pending_draft_id>"}` | Explicitly abandon the referenced pending map write and accept a fresh getter |
+
+Recovery is for a command that never took effect, a completed task whose
+intent survived a restart, or an acknowledged map Save that did not persist.
+First observe the robot at the dock and let the existing task finish.
+Recovery requires three fresh matched, fully idle, error-free docked status
+reads spanning at least 20 seconds on one connection. An active or paused
+task, a fault, a connection change or a mismatched pending reference refuses.
+Map recovery additionally requires no pending motion and a valid fresh map
+with the same map ID, followed by another idle status check.
+
+Neither recovery action sends a cleaning command or a map setter. The pending
+store is copied to a mode-600 `*.abandoned-<id>.json` file in the private state
+directory before clearing. A map write's previous map remains in `last_backup`.
+Abandonment acknowledges uncertainty; it does not mark the original action as
+successful or promise that an edited layout persisted. The next job requires
+a fresh explicit Start. These actions are loopback-only and are not exposed
+as MQTT cleaning or editor actions.
+
+## Motion commands
+
 The command profile supplies explicit source, no-op and feedback tuples.
 The engine additionally checks fresh connection generation, status revision,
 mode, main task, queue and cleaning order. A wire ACK and fresh resulting

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 description = "Local Narwal J1 bridge for Home Assistant MQTT discovery"
-repository = "https://github.com/simon-lee-1/narwal-local-ha-private"
+repository = "https://github.com/simon-lee-1/narwal-local-ha"
 
 [dependencies]
 axum = "0.8.9"

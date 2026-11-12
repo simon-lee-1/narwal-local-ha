@@ -179,7 +179,7 @@ pub fn private_read(path: &Path) -> Result<Vec<u8>, String> {
     if !path.is_absolute()
         || !meta.is_dir()
         || meta.uid() != uid
-        || meta.mode() & 0o777 != 0o700
+        || meta.mode() & 0o7777 != 0o700
         || std::fs::canonicalize(parent).map_err(|_| "private_directory_unavailable")? != parent
     {
         return Err("unsafe_private_directory".into());
@@ -192,7 +192,7 @@ pub fn private_read(path: &Path) -> Result<Vec<u8>, String> {
     let before = file.metadata().map_err(|_| "private_file_unavailable")?;
     if !before.is_file()
         || before.uid() != uid
-        || before.mode() & 0o777 != 0o600
+        || before.mode() & 0o7777 != 0o600
         || before.nlink() != 1
         || before.len() > 8 * 1024 * 1024
     {
@@ -206,4 +206,46 @@ pub fn private_read(path: &Path) -> Result<Vec<u8>, String> {
         return Err("private_file_changed_or_too_large".into());
     }
     Ok(result)
+}
+
+/// Preserve the exact pending store before an explicit local abandonment.
+/// The private parent and source are validated by the same reader as startup.
+pub(crate) fn backup_pending(path: &Path, id: &str) -> Result<(), String> {
+    use std::io::Write;
+    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("recovery_backup_failed".into());
+    }
+    let bytes = private_read(path)?;
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or("recovery_backup_failed")?;
+    let backup = path.with_file_name(format!("{stem}.abandoned-{id}.json"));
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&backup)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // A prior recovery may have created its backup and then refused.
+            if private_read(&backup)? == bytes {
+                return Ok(());
+            }
+            return Err("recovery_backup_changed".into());
+        }
+        Err(_) => return Err("recovery_backup_failed".into()),
+    };
+    file.write_all(&bytes)
+        .map_err(|_| "recovery_backup_failed")?;
+    file.sync_all().map_err(|_| "recovery_backup_failed")?;
+    std::fs::File::open(path.parent().ok_or("recovery_backup_failed")?)
+        .and_then(|parent| parent.sync_all())
+        .map_err(|_| "recovery_backup_failed")?;
+    if private_read(&backup)? != bytes {
+        return Err("recovery_backup_changed".into());
+    }
+    Ok(())
 }

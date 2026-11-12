@@ -42,4 +42,4 @@ TasksMax=8
 MemoryMax=64M
 StandardInput=null
 StandardOutput=null
-StandardError=null
+StandardError=journal
